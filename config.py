@@ -30,7 +30,7 @@ name2sovits_path = {
     # i18n("不训练直接推v1底模！"): "GPT_SoVITS/pretrained_models/s2G488k.pth",
     i18n("不训练直接推v2底模！"): "GPT_SoVITS/pretrained_models/gsv-v2final-pretrained/s2G2333k.pth",
     # i18n("不训练直接推v3底模！"): "GPT_SoVITS/pretrained_models/s2Gv3.pth",
-    # i18n("不训练直接推v4底模！"): "GPT_SoVITS/pretrained_models/gsv-v4-pretrained/s2Gv4.pth",
+    i18n("不训练直接推v4底模！"): "GPT_SoVITS/pretrained_models/gsv-v4-pretrained/s2Gv4.pth",
     i18n("不训练直接推v2Pro底模！"): "GPT_SoVITS/pretrained_models/v2Pro/s2Gv2Pro.pth",
     i18n("不训练直接推v2ProPlus底模！"): "GPT_SoVITS/pretrained_models/v2Pro/s2Gv2ProPlus.pth",
 }
@@ -137,12 +137,12 @@ pretrained_gpt_path = "GPT_SoVITS/pretrained_models/s1bert25hz-2kh-longer-epoch=
 exp_root = "logs"
 python_exec = sys.executable or "python"
 
-webui_port_main = 9874
-webui_port_uvr5 = 9873
-webui_port_infer_tts = 9872
-webui_port_subfix = 9871
+webui_port_main = int(os.environ.get("webui_port_main", "9874"))
+webui_port_uvr5 = int(os.environ.get("webui_port_uvr5", "9873"))
+webui_port_infer_tts = int(os.environ.get("webui_port_infer_tts", "9872"))
+webui_port_subfix = int(os.environ.get("webui_port_subfix", "9871"))
 
-api_port = 9880
+api_port = int(os.environ.get("api_port", "9880"))
 
 
 # Thanks to the contribution of @Karasukaigan and @XXXXRT666
@@ -216,3 +216,5 @@ class Config:
         self.webui_port_subfix = webui_port_subfix
 
         self.api_port = api_port
+
+
