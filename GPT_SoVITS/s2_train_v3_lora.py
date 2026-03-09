@@ -55,17 +55,20 @@ def main():
         n_gpus = torch.cuda.device_count()
     else:
         n_gpus = 1
-    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(randint(20000, 55555))
 
-    mp.spawn(
-        run,
-        nprocs=n_gpus,
-        args=(
-            n_gpus,
-            hps,
-        ),
-    )
+    if n_gpus == 1:
+        run(0, n_gpus, hps)
+    else:
+        mp.spawn(
+            run,
+            nprocs=n_gpus,
+            args=(
+                n_gpus,
+                hps,
+            ),
+        )
 
 
 def run(rank, n_gpus, hps):
@@ -77,12 +80,16 @@ def run(rank, n_gpus, hps):
         writer = SummaryWriter(log_dir=hps.s2_ckpt_dir)
         writer_eval = SummaryWriter(log_dir=os.path.join(hps.s2_ckpt_dir, "eval"))
 
-    dist.init_process_group(
-        backend="gloo" if os.name == "nt" or not torch.cuda.is_available() else "nccl",
-        init_method="env://?use_libuv=False",
-        world_size=n_gpus,
-        rank=rank,
-    )
+    use_ddp = n_gpus > 1
+    if use_ddp:
+        backend = "gloo" if os.name == "nt" or not torch.cuda.is_available() else "nccl"
+        init_method = f"tcp://127.0.0.1:{os.environ['MASTER_PORT']}" if os.name == "nt" else "env://?use_libuv=False"
+        dist.init_process_group(
+            backend=backend,
+            init_method=init_method,
+            world_size=n_gpus,
+            rank=rank,
+        )
     torch.manual_seed(hps.train.seed)
     if torch.cuda.is_available():
         torch.cuda.set_device(rank)
@@ -156,7 +163,9 @@ def run(rank, n_gpus, hps):
 
     def model2cuda(net_g, rank):
         if torch.cuda.is_available():
-            net_g = DDP(net_g.cuda(rank), device_ids=[rank], find_unused_parameters=True)
+            net_g = net_g.cuda(rank)
+            if use_ddp:
+                net_g = DDP(net_g, device_ids=[rank], find_unused_parameters=True)
         else:
             net_g = net_g.to(device)
         return net_g
@@ -188,7 +197,7 @@ def run(rank, n_gpus, hps):
                 logger.info("loaded pretrained %s" % hps.train.pretrained_s2G)
             print(
                 "loaded pretrained %s" % hps.train.pretrained_s2G,
-                net_g.load_state_dict(
+                (net_g.module if use_ddp else net_g).load_state_dict(
                     torch.load(hps.train.pretrained_s2G, map_location="cpu", weights_only=False)["weight"],
                     strict=False,
                 ),
@@ -343,17 +352,17 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
                 epoch,
                 os.path.join(save_root, "G_{}.pth".format(233333333333)),
             )
-        if rank == 0 and hps.train.if_save_every_weights == True:
+        should_export_weight = bool(hps.train.if_save_every_weights) or epoch == hps.train.epochs
+        if rank == 0 and should_export_weight:
             if hasattr(net_g, "module"):
                 ckpt = net_g.module.state_dict()
             else:
                 ckpt = net_g.state_dict()
             sim_ckpt = od()
             for key in ckpt:
-                # if "cfm"not in key:
-                #     print(key)
                 if key not in no_grad_names:
                     sim_ckpt[key] = ckpt[key].half().cpu()
+            export_name = hps.name + "_e%s_s%s_l%s" % (epoch, global_step, lora_rank)
             logger.info(
                 "saving ckpt %s_e%s:%s"
                 % (
@@ -361,7 +370,7 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
                     epoch,
                     savee(
                         sim_ckpt,
-                        hps.name + "_e%s_s%s_l%s" % (epoch, global_step, lora_rank),
+                        export_name,
                         epoch,
                         global_step,
                         hps,
@@ -377,3 +386,4 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
 
 if __name__ == "__main__":
     main()
+

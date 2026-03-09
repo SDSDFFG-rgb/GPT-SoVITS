@@ -30,6 +30,23 @@ function Ensure-Directory([string]$Path) {
     }
 }
 
+function Prompt-YesNo([string]$Message, [bool]$DefaultYes = $true) {
+    $suffix = if ($DefaultYes) { ' [Y/n]' } else { ' [y/N]' }
+    while ($true) {
+        $reply = Read-Host ($Message + $suffix)
+        if ([string]::IsNullOrWhiteSpace($reply)) {
+            return $DefaultYes
+        }
+        switch ($reply.Trim().ToLowerInvariant()) {
+            'y' { return $true }
+            'yes' { return $true }
+            'n' { return $false }
+            'no' { return $false }
+        }
+        Write-Host 'Please answer y or n.' -ForegroundColor Yellow
+    }
+}
+
 if (-not (Test-Path $PythonExe)) {
     throw "Python not found: $PythonExe"
 }
@@ -51,17 +68,39 @@ Write-Step "Installing Python dependencies"
 & $venvPython -m pip install -r extra-req.txt --no-deps
 & $venvPython -m pip install -r requirements.txt
 & $venvPython -m pip install onnxruntime
+& $venvPython -m pip install moonshine-voice
 
 $pretrainedZip = Join-Path $PSScriptRoot "pretrained_models.zip"
 $g2pwZip = Join-Path $PSScriptRoot "G2PWModel.zip"
 $nltkZip = Join-Path $PSScriptRoot "nltk_data.zip"
 $openJTalkTar = Join-Path $PSScriptRoot "open_jtalk_dic_utf_8-1.11.tar.gz"
+$downloadLegacyBundle = $false
 
-if (-not (Test-Path "GPT_SoVITS\pretrained_models\sv")) {
-    Ensure-FileDownload "https://huggingface.co/XXXXRT/GPT-SoVITS-Pretrained/resolve/main/pretrained_models.zip" $pretrainedZip
-    Write-Step "Extracting pretrained base assets"
-    Expand-Archive -Path $pretrainedZip -DestinationPath "GPT_SoVITS" -Force
-    Remove-Item $pretrainedZip -Force
+if (-not (Test-Path "GPT_SoVITS\pretrained_models\chinese-roberta-wwm-ext-large") -or
+    -not (Test-Path "GPT_SoVITS\pretrained_models\chinese-hubert-base") -or
+    -not (Test-Path "GPT_SoVITS\pretrained_models\s1v3.ckpt")) {
+    $downloadLegacyBundle = Prompt-YesNo "Download pretrained_models.zip? This bundle contains legacy v1/v2/v3 models plus shared base assets. Choose 'No' to download only the minimal base files required for v4/v2Pro."
+    if ($downloadLegacyBundle) {
+        Ensure-FileDownload "https://huggingface.co/XXXXRT/GPT-SoVITS-Pretrained/resolve/main/pretrained_models.zip" $pretrainedZip
+        Write-Step "Extracting pretrained base assets"
+        Expand-Archive -Path $pretrainedZip -DestinationPath "GPT_SoVITS" -Force
+        Remove-Item $pretrainedZip -Force
+    }
+}
+
+$baseModelFiles = @(
+    @{ Url = "https://huggingface.co/lj1995/GPT-SoVITS/resolve/main/s1v3.ckpt"; Path = "GPT_SoVITS\pretrained_models\s1v3.ckpt" },
+    @{ Url = "https://huggingface.co/hfl/chinese-roberta-wwm-ext-large/resolve/main/config.json"; Path = "GPT_SoVITS\pretrained_models\chinese-roberta-wwm-ext-large\config.json" },
+    @{ Url = "https://huggingface.co/hfl/chinese-roberta-wwm-ext-large/resolve/main/tokenizer.json"; Path = "GPT_SoVITS\pretrained_models\chinese-roberta-wwm-ext-large\tokenizer.json" },
+    @{ Url = "https://huggingface.co/hfl/chinese-roberta-wwm-ext-large/resolve/main/pytorch_model.bin"; Path = "GPT_SoVITS\pretrained_models\chinese-roberta-wwm-ext-large\pytorch_model.bin" },
+    @{ Url = "https://huggingface.co/TencentGameMate/chinese-hubert-base/resolve/main/config.json"; Path = "GPT_SoVITS\pretrained_models\chinese-hubert-base\config.json" },
+    @{ Url = "https://huggingface.co/TencentGameMate/chinese-hubert-base/resolve/main/preprocessor_config.json"; Path = "GPT_SoVITS\pretrained_models\chinese-hubert-base\preprocessor_config.json" },
+    @{ Url = "https://huggingface.co/TencentGameMate/chinese-hubert-base/resolve/main/pytorch_model.bin"; Path = "GPT_SoVITS\pretrained_models\chinese-hubert-base\pytorch_model.bin" },
+    @{ Url = "https://dl.fbaipublicfiles.com/fasttext/supervised-models/lid.176.bin"; Path = "GPT_SoVITS\pretrained_models\fast_langdetect\lid.176.bin" }
+)
+foreach ($item in $baseModelFiles) {
+    Ensure-Directory (Split-Path -Parent $item.Path)
+    Ensure-FileDownload $item.Url $item.Path
 }
 
 if (-not (Test-Path "GPT_SoVITS\text\G2PWModel")) {
@@ -99,7 +138,10 @@ foreach ($item in $modelFiles) {
 
 Write-Step "Running syntax check"
 & $venvPython -m py_compile "$PSScriptRoot\GPT_SoVITS\inference_webui_1c_ja.py"
+& $venvPython -m py_compile "$PSScriptRoot\GPT_SoVITS\train_webui_1m_ja.py"
 
 Write-Step "Setup complete"
 Write-Host "Run go-webui-ja.bat for the full Japanese WebUI"
 Write-Host "Run go-1c-infer-ja.bat for the dedicated Japanese 1C inference UI"
+Write-Host "Run go-1m-train-ja.bat for the Japanese 1-minute training UI"
+

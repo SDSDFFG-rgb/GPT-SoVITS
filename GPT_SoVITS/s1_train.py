@@ -59,7 +59,8 @@ class my_model_ckpt(ModelCheckpoint):
                             os.remove("%s/%s" % (self.dirpath, name))
                         except:
                             pass
-                if self.if_save_every_weights == True:
+                should_export_weight = bool(self.if_save_every_weights) or (trainer.current_epoch + 1) >= trainer.max_epochs
+                if should_export_weight:
                     to_save_od = OrderedDict()
                     to_save_od["weight"] = OrderedDict()
                     dictt = trainer.strategy._lightning_module.state_dict()
@@ -67,8 +68,6 @@ class my_model_ckpt(ModelCheckpoint):
                         to_save_od["weight"][key] = dictt[key].half()
                     to_save_od["config"] = self.config
                     to_save_od["info"] = "GPT-e%s" % (trainer.current_epoch + 1)
-                    # torch.save(
-                    # print(os.environ)
                     if os.environ.get("LOCAL_RANK", "0") == "0":
                         my_save(
                             to_save_od,
@@ -106,25 +105,29 @@ def main(args):
         dirpath=ckpt_dir,
     )
     logger = TensorBoardLogger(name=output_dir.stem, save_dir=output_dir)
-    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["USE_LIBUV"] = "0"
+    gpu_count = torch.cuda.device_count() if torch.cuda.is_available() else 0
     trainer: Trainer = Trainer(
         max_epochs=config["train"]["epochs"],
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
         # val_check_interval=9999999999999999999999,###不要验证
         # check_val_every_n_epoch=None,
         limit_val_batches=0,
-        devices=-1 if torch.cuda.is_available() else 1,
+        devices=gpu_count if gpu_count > 1 else 1,
         benchmark=False,
         fast_dev_run=False,
-        strategy=DDPStrategy(process_group_backend="nccl" if platform.system() != "Windows" else "gloo")
-        if torch.cuda.is_available()
-        else "auto",
+        strategy=(
+            DDPStrategy(process_group_backend="nccl" if platform.system() != "Windows" else "gloo")
+            if gpu_count > 1
+            else "auto"
+        ),
         precision=config["train"]["precision"],
         logger=logger,
         num_sanity_val_steps=0,
         callbacks=[ckpt_callback],
         use_distributed_sampler=False,  # 非常简单的修改，但解决了采用自定义的 bucket_sampler 下训练步数不一致的问题！
+        enable_progress_bar=False,
     )
 
     model: Text2SemanticLightningModule = Text2SemanticLightningModule(config, output_dir)
@@ -169,3 +172,4 @@ if __name__ == "__main__":
     args = parser.parse_args()
     logging.info(str(args))
     main(args)
+

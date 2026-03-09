@@ -55,17 +55,20 @@ def main():
         n_gpus = torch.cuda.device_count()
     else:
         n_gpus = 1
-    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(randint(20000, 55555))
 
-    mp.spawn(
-        run,
-        nprocs=n_gpus,
-        args=(
-            n_gpus,
-            hps,
-        ),
-    )
+    if n_gpus == 1:
+        run(0, n_gpus, hps)
+    else:
+        mp.spawn(
+            run,
+            nprocs=n_gpus,
+            args=(
+                n_gpus,
+                hps,
+            ),
+        )
 
 
 def run(rank, n_gpus, hps):
@@ -77,12 +80,16 @@ def run(rank, n_gpus, hps):
         writer = SummaryWriter(log_dir=hps.s2_ckpt_dir)
         writer_eval = SummaryWriter(log_dir=os.path.join(hps.s2_ckpt_dir, "eval"))
 
-    dist.init_process_group(
-        backend="gloo" if os.name == "nt" or not torch.cuda.is_available() else "nccl",
-        init_method="env://?use_libuv=False",
-        world_size=n_gpus,
-        rank=rank,
-    )
+    use_ddp = n_gpus > 1
+    if use_ddp:
+        backend = "gloo" if os.name == "nt" or not torch.cuda.is_available() else "nccl"
+        init_method = f"tcp://127.0.0.1:{os.environ['MASTER_PORT']}" if os.name == "nt" else "env://?use_libuv=False"
+        dist.init_process_group(
+            backend=backend,
+            init_method=init_method,
+            world_size=n_gpus,
+            rank=rank,
+        )
     torch.manual_seed(hps.train.seed)
     if torch.cuda.is_available():
         torch.cuda.set_device(rank)
@@ -197,8 +204,9 @@ def run(rank, n_gpus, hps):
         eps=hps.train.eps,
     )
     if torch.cuda.is_available():
-        net_g = DDP(net_g, device_ids=[rank], find_unused_parameters=True)
-        net_d = DDP(net_d, device_ids=[rank], find_unused_parameters=True)
+        if use_ddp:
+            net_g = DDP(net_g, device_ids=[rank], find_unused_parameters=True)
+            net_d = DDP(net_d, device_ids=[rank], find_unused_parameters=True)
     else:
         net_g = net_g.to(device)
         net_d = net_d.to(device)
@@ -234,7 +242,7 @@ def run(rank, n_gpus, hps):
                 logger.info("loaded pretrained %s" % hps.train.pretrained_s2G)
             print(
                 "loaded pretrained %s" % hps.train.pretrained_s2G,
-                net_g.module.load_state_dict(
+                (net_g.module if use_ddp else net_g).load_state_dict(
                     torch.load(hps.train.pretrained_s2G, map_location="cpu", weights_only=False)["weight"],
                     strict=False,
                 )
@@ -253,7 +261,7 @@ def run(rank, n_gpus, hps):
                 logger.info("loaded pretrained %s" % hps.train.pretrained_s2D)
             print(
                 "loaded pretrained %s" % hps.train.pretrained_s2D,
-                net_d.module.load_state_dict(
+                (net_d.module if use_ddp else net_d).load_state_dict(
                     torch.load(hps.train.pretrained_s2D, map_location="cpu", weights_only=False)["weight"], strict=False
                 )
                 if torch.cuda.is_available()
@@ -554,11 +562,13 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
                     "D_{}.pth".format(233333333333),
                 ),
             )
-        if rank == 0 and hps.train.if_save_every_weights == True:
+        should_export_weight = bool(hps.train.if_save_every_weights) or epoch == hps.train.epochs
+        if rank == 0 and should_export_weight:
             if hasattr(net_g, "module"):
                 ckpt = net_g.module.state_dict()
             else:
                 ckpt = net_g.state_dict()
+            export_name = hps.name + "_e%s_s%s" % (epoch, global_step)
             logger.info(
                 "saving ckpt %s_e%s:%s"
                 % (
@@ -566,7 +576,7 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
                     epoch,
                     savee(
                         ckpt,
-                        hps.name + "_e%s_s%s" % (epoch, global_step),
+                        export_name,
                         epoch,
                         global_step,
                         hps,
@@ -682,3 +692,4 @@ def evaluate(hps, generator, eval_loader, writer_eval):
 
 if __name__ == "__main__":
     main()
+
