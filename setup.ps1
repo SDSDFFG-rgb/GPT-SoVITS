@@ -139,9 +139,13 @@ foreach ($item in $modelFiles) {
 Write-Step "Running syntax check"
 & $venvPython -m py_compile "$PSScriptRoot\GPT_SoVITS\inference_webui_1c_ja.py"
 & $venvPython -m py_compile "$PSScriptRoot\GPT_SoVITS\train_webui_1m_ja.py"
+& $venvPython -m py_compile "$PSScriptRoot\GPT_SoVITS\train_webui_long_ja.py"`r`n& $venvPython -m py_compile "$PSScriptRoot\GPT_SoVITS\inference_webui_1c_emotion_ja.py"
 
 Write-Step "Setup complete"
 Write-Host "Run go-webui-ja.bat for the full Japanese WebUI"
 Write-Host "Run go-1c-infer-ja.bat for the dedicated Japanese 1C inference UI"
 Write-Host "Run go-1m-train-ja.bat for the Japanese 1-minute training UI"
+Write-Host "Run go-long-train-ja.bat for the Japanese long-form training UI"`r`nWrite-Host "Optional Maxine runtime: place D:\gpt-sovits\Maxine-AFX-Runtime outside the repo if you want denoise in the long-form UI."
+
+
 

@@ -52,6 +52,7 @@ DEFAULT_VERSION = os.environ.get("version", "v2Pro")
 CURRENT_PROCESS = None
 CURRENT_PROCESS_NAME = ""
 WHISPER_MODEL = None
+SESSION_KIND = '1min'
 
 
 def sanitize_name(value):
@@ -103,9 +104,10 @@ def kill_process(pid):
         kill_proc_tree(pid)
 
 
-def ensure_session(save_name, speaker_name, language_code):
+def ensure_session(save_name, speaker_name, language_code, temporary=False):
     sid = datetime.now().strftime('%Y%m%d-%H%M%S-%f')
-    base = SESSION_ROOT / f"{sid}_{sanitize_name(save_name)}"
+    base_root = TEMP_ROOT if temporary else SESSION_ROOT
+    base = base_root / f"{sid}_{SESSION_KIND}_{sanitize_name(save_name)}"
     for name in ['uploads', 'edited', 'dataset', 'transcripts']:
         (base / name).mkdir(parents=True, exist_ok=True)
     return {
@@ -116,6 +118,8 @@ def ensure_session(save_name, speaker_name, language_code):
         'clips': [],
         'dataset': {},
         'latest_weights': {},
+        'session_kind': SESSION_KIND,
+        'is_temp_session': temporary,
     }
 
 
@@ -179,11 +183,58 @@ def editor_outputs(state, message=''):
     )
 
 
+
+def session_kind_matches(session_dir):
+    state_path = session_dir / 'session_state.json'
+    fallback_path = session_dir / 'dataset' / 'session.json'
+    target = state_path if state_path.exists() else fallback_path
+    if target.exists():
+        try:
+            data = json.loads(target.read_text(encoding='utf-8'))
+            kind = data.get('session_kind')
+            if kind:
+                return kind == SESSION_KIND
+            return 'sources' not in data
+        except Exception:
+            pass
+    return f'_{SESSION_KIND}_' in session_dir.name
+
+
+def session_label(session_dir):
+    state_path = session_dir / 'session_state.json'
+    fallback_path = session_dir / 'dataset' / 'session.json'
+    target = state_path if state_path.exists() else fallback_path
+    save_name = session_dir.name
+    speaker_name = ''
+    if target.exists():
+        try:
+            data = json.loads(target.read_text(encoding='utf-8'))
+            save_name = data.get('save_name') or save_name
+            speaker_name = data.get('speaker_name') or ''
+        except Exception:
+            pass
+    stamp = session_dir.name.split('_', 1)[0]
+    if len(stamp) >= 13 and '-' in stamp:
+        display_stamp = f"{stamp[:4]}-{stamp[4:6]}-{stamp[6:8]} {stamp[9:11]}:{stamp[11:13]}"
+    else:
+        display_stamp = stamp
+    if speaker_name and speaker_name != save_name:
+        return f'{save_name} / {speaker_name} / {display_stamp} | {session_dir.name}'
+    return f'{save_name} / {display_stamp} | {session_dir.name}'
+
+
+def session_name_from_choice(choice):
+    if not choice:
+        return ''
+    text = str(choice)
+    if '|' in text:
+        return text.rsplit('|', 1)[-1].strip()
+    return text.strip()
 def session_options():
     sessions = []
     for session_dir in sorted(SESSION_ROOT.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
-        if session_dir.is_dir():
-            sessions.append(session_dir.name)
+        if session_dir.is_dir() and session_kind_matches(session_dir):
+            sessions.append(session_label(session_dir))
     return sessions
 
 
@@ -196,6 +247,7 @@ def normalize_loaded_state(state):
     state.setdefault('clips', [])
     state.setdefault('dataset', {})
     state.setdefault('latest_weights', {})
+    state.setdefault('session_kind', SESSION_KIND)
     session_dir = Path(state['session_dir'])
     dataset_dir = session_dir / 'dataset'
     ds = state['dataset']
@@ -230,6 +282,7 @@ def refresh_session_list(selected_name=None):
 
 
 def load_saved_session(session_name):
+    session_name = session_name_from_choice(session_name)
     choices = session_options()
     if not session_name:
         return (
@@ -280,10 +333,99 @@ def load_saved_session(session_name):
         gr.update(choices=choices, value=session_name),
     )
 
+
+def delete_saved_session(session_name):
+    session_name = session_name_from_choice(session_name)
+    choices_before = session_options()
+    if not session_name:
+        return gr.update(choices=choices_before, value=None), '削除するセッションを選んでください。'
+    session_dir = SESSION_ROOT / session_name
+    if not session_dir.exists():
+        choices_after = session_options()
+        return gr.update(choices=choices_after, value=(choices_after[0] if choices_after else None)), f'セッションが見つかりません: {session_name}'
+    shutil.rmtree(session_dir, ignore_errors=True)
+    choices_after = session_options()
+    return gr.update(choices=choices_after, value=(choices_after[0] if choices_after else None)), f'セッションを削除しました: {session_name}'
+
+
+def clone_for_new_session(value, old_session_dir, new_session_dir):
+    if isinstance(value, dict):
+        return {k: clone_for_new_session(v, old_session_dir, new_session_dir) for k, v in value.items()}
+    if isinstance(value, list):
+        return [clone_for_new_session(v, old_session_dir, new_session_dir) for v in value]
+    if isinstance(value, str) and old_session_dir in value:
+        return value.replace(old_session_dir, new_session_dir)
+    return value
+
+
+
+def materialize_session(state, save_name, speaker_name, language_code):
+    if not state or not state.get('session_dir'):
+        return state, False
+    if not state.get('is_temp_session'):
+        return state, False
+    new_state = ensure_session(save_name, speaker_name, language_code, temporary=False)
+    old_dir = Path(state['session_dir'])
+    new_dir = Path(new_state['session_dir'])
+    for child in old_dir.iterdir():
+        target = new_dir / child.name
+        if child.is_dir():
+            shutil.copytree(child, target, dirs_exist_ok=True)
+        else:
+            shutil.copy2(child, target)
+    migrated = clone_for_new_session(json.loads(json.dumps(state, ensure_ascii=False)), str(old_dir), str(new_dir))
+    migrated['session_dir'] = str(new_dir)
+    migrated['save_name'] = sanitize_name(save_name)
+    migrated['speaker_name'] = derive_speaker(save_name, speaker_name)
+    migrated['language_code'] = (language_code or 'ja').strip() or 'ja'
+    migrated['session_kind'] = SESSION_KIND
+    migrated['is_temp_session'] = False
+    shutil.rmtree(old_dir, ignore_errors=True)
+    save_state(migrated)
+    return migrated, True
+
+
+def clone_current_session(state, save_name, speaker_name, language_code):
+    if not state or not state.get('session_dir'):
+        return None, '先に複製元のセッションを読み込んでください。', [], {}, '', '', gr.update(choices=session_options(), value=None)
+    new_state = ensure_session(save_name, speaker_name, language_code, temporary=False)
+    old_dir = Path(state['session_dir'])
+    new_dir = Path(new_state['session_dir'])
+    for folder in ['uploads', 'edited', 'transcripts', 'dataset']:
+        src_dir = old_dir / folder
+        dst_dir = new_dir / folder
+        if src_dir.exists():
+            shutil.copytree(src_dir, dst_dir, dirs_exist_ok=True)
+    cloned = clone_for_new_session(json.loads(json.dumps(state, ensure_ascii=False)), str(old_dir), str(new_dir))
+    cloned['session_dir'] = str(new_dir)
+    cloned['save_name'] = sanitize_name(save_name)
+    cloned['speaker_name'] = derive_speaker(save_name, speaker_name)
+    cloned['language_code'] = (language_code or 'ja').strip() or 'ja'
+    cloned['session_kind'] = SESSION_KIND
+    if cloned.get('dataset', {}).get('list_path'):
+        list_path = Path(cloned['dataset']['list_path'])
+        if list_path.exists():
+            rows = []
+            for row in list_path.read_text(encoding='utf-8').splitlines():
+                if not row.strip():
+                    continue
+                parts = row.split('|', 3)
+                if len(parts) == 4:
+                    parts[1] = cloned['speaker_name']
+                    parts[2] = cloned['language_code']
+                    rows.append('|'.join(parts))
+                else:
+                    rows.append(row)
+            list_path.write_text('\n'.join(rows) + ('\n' if rows else ''), encoding='utf-8')
+    (Path(cloned['session_dir']) / 'session_state.json').write_text(json.dumps(cloned, ensure_ascii=False, indent=2), encoding='utf-8')
+    choices = session_options()
+    selected = next((choice for choice in choices if choice.endswith('| ' + new_dir.name)), None)
+    ds = cloned.get('dataset', {})
+    return cloned, f'新しい 1分学習セッションとして保存しました: {new_dir.name}', clip_rows(cloned), state_summary(cloned), ds.get('list_path', ''), ds.get('wav_dir', ''), gr.update(choices=choices, value=selected)
 def load_files(files, save_name, speaker_name, language_code):
     if not files:
         return editor_outputs(None, '音声ファイルをドロップしてください。')
-    state = ensure_session(save_name, speaker_name, language_code)
+    state = ensure_session(save_name, speaker_name, language_code, temporary=True)
     upload_dir = Path(state['session_dir']) / 'uploads'
     clips = []
     for i, file_obj in enumerate(files):
@@ -404,7 +546,8 @@ def save_editor_rows(state, *values):
     session_state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding='utf-8')
     kept = sum(1 for clip in state['clips'] if clip['keep'])
     filled = sum(1 for clip in state['clips'] if clip['text'])
-    return state, f'一覧の編集を保存しました。採用 {kept} 件 / テキスト入力済み {filled} 件。', clip_rows(state), state_summary(state)
+    prefix = '新規保存しました。' if materialized else '一覧の編集を保存しました。'
+    return state, f'{prefix} 採用 {kept} 件 / テキスト入力済み {filled} 件。', clip_rows(state), state_summary(state)
 
 
 def export_dataset(state, save_name, speaker_name, language_code):
@@ -788,6 +931,8 @@ with gr.Blocks(title='GPT-SoVITS 1分学習 UI', css=css, js=js) as app:
                 session_picker = gr.Dropdown(label='保存済みセッション', choices=session_options(), value=None, allow_custom_value=False)
                 refresh_sessions_btn = gr.Button('一覧を更新')
                 load_session_btn = gr.Button('選択したセッションを読み込む')
+                clone_session_btn = gr.Button('別セッションとして保存')
+                delete_session_btn = gr.Button('選択したセッションを削除')
     clip_table = gr.Dataframe(headers=['ID', '状態', 'ファイル', '秒数', 'テキスト'], datatype=['number', 'str', 'str', 'str', 'str'], interactive=False, wrap=True, label='読み込んだファイル一覧')
 
     gr.Markdown('## クリップ編集\n読み込んだファイルを上から順に確認します。左の波形でそのままトリムし、右で文字を直してください。')
@@ -824,8 +969,9 @@ with gr.Blocks(title='GPT-SoVITS 1分学習 UI', css=css, js=js) as app:
                     )
                 row_inputs.extend([audio_editor, text_editor, keep_editor])
             gr.Markdown('---')
-        save_all_btn = gr.Button('一覧の編集を保存', variant='primary')
+        save_all_btn = gr.Button('現在のセッションに上書き保存', variant='primary')
         save_all_btn.click(save_editor_rows, [state] + row_inputs, [state, editor_status, clip_table, session_json])
+        gr.Markdown('読み込み済みの既存セッションなら、そのまま同じ session_state.json と 	ranscripts/*.txt に上書き保存されます。')
 
     gr.Markdown('## 学習データ書き出し\nここで .list と学習用の WAV 一式を作ります。除外したクリップは出力されません。')
     with gr.Row():
@@ -880,6 +1026,8 @@ with gr.Blocks(title='GPT-SoVITS 1分学習 UI', css=css, js=js) as app:
     export_btn.click(export_dataset, [state, save_name, speaker_name, language_code], shared_outputs)
     refresh_sessions_btn.click(refresh_session_list, [session_picker], [session_picker, status])
     load_session_btn.click(load_saved_session, [session_picker], [state, status, clip_table, session_json, list_path, wav_dir, save_name, speaker_name, language_code, session_picker])
+    clone_session_btn.click(clone_current_session, [state, save_name, speaker_name, language_code], [state, status, clip_table, session_json, list_path, wav_dir, session_picker])
+    delete_session_btn.click(delete_saved_session, [session_picker], [session_picker, status])
     version.change(version_weight_updates, [version, custom_pretrained], [pretrained_s1, pretrained_s2g, pretrained_s2d, model_guide])
     custom_pretrained.change(custom_pretrained_updates, [custom_pretrained, version], [pretrained_s1, pretrained_s2g, pretrained_s2d, model_guide])
     preprocess_btn.click(preprocess_action, [state, version, gpu_number, bert_dir, ssl_dir, pretrained_s2g, sv_path], [state, status, session_json, train_log])
@@ -891,6 +1039,9 @@ with gr.Blocks(title='GPT-SoVITS 1分学習 UI', css=css, js=js) as app:
     open_infer_btn.click(open_inference_ui, outputs=[status])
 
 app.queue().launch(server_name='0.0.0.0', server_port=DEFAULT_PORT, share=False, inbrowser=True)
+
+
+
 
 
 

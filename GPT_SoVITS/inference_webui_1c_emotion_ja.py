@@ -38,6 +38,162 @@ EMOTION_LABELS = {
 }
 CONFIG_PATH = Path(ROOT_DIR) / "emotion_presets.txt"
 SCRIPT_EXAMPLE = "[happy]おはよう。[relax]今日はゆっくり話そう。[surprise]えっ、本当に？"
+LONG_SESSION_ROOT = Path(ROOT_DIR) / "outputs" / "minute_training"
+
+
+def long_session_matches(session_dir):
+    state_path = session_dir / "session_state.json"
+    if not state_path.exists():
+        return False
+    try:
+        data = json.loads(state_path.read_text(encoding="utf-8"))
+        kind = data.get("session_kind")
+        if kind:
+            return kind == "long"
+        return "sources" in data
+    except Exception:
+        return False
+
+
+def long_session_label(session_dir):
+    state_path = session_dir / "session_state.json"
+    save_name = session_dir.name
+    speaker_name = ""
+    try:
+        data = json.loads(state_path.read_text(encoding="utf-8"))
+        save_name = data.get("save_name") or save_name
+        speaker_name = data.get("speaker_name") or ""
+    except Exception:
+        pass
+    stamp = session_dir.name.split("_", 1)[0]
+    if speaker_name and speaker_name != save_name:
+        return f"{save_name} / {speaker_name} / {stamp} | {session_dir.name}"
+    return f"{save_name} / {stamp} | {session_dir.name}"
+
+
+def long_session_name_from_choice(choice):
+    if not choice:
+        return ""
+    text = str(choice)
+    if "|" in text:
+        return text.rsplit("|", 1)[-1].strip()
+    return text.strip()
+
+
+def long_session_options():
+    if not LONG_SESSION_ROOT.exists():
+        return []
+    sessions = []
+    for session_dir in sorted(LONG_SESSION_ROOT.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
+        if session_dir.is_dir() and long_session_matches(session_dir):
+            sessions.append(long_session_label(session_dir))
+    return sessions
+
+
+def resolve_long_session_audio(path_value, session_dir):
+    if not path_value:
+        return ""
+    candidate = Path(path_value)
+    if candidate.exists():
+        return str(candidate)
+    try:
+        state_dir = Path(json.loads((session_dir / "session_state.json").read_text(encoding="utf-8")).get("session_dir", ""))
+    except Exception:
+        state_dir = None
+    if state_dir and str(candidate).startswith(str(state_dir)):
+        alt = Path(str(candidate).replace(str(state_dir), str(session_dir), 1))
+        if alt.exists():
+            return str(alt)
+    fallback = session_dir / "segments" / candidate.name
+    if fallback.exists():
+        return str(fallback)
+    return ""
+
+
+def build_long_reference_choices(session_name):
+    session_name = long_session_name_from_choice(session_name)
+    if not session_name:
+        return [], {}, ""
+    session_dir = LONG_SESSION_ROOT / session_name
+    state_path = session_dir / "session_state.json"
+    if not state_path.exists():
+        return [], {}, f"セッション情報が見つかりません: {session_name}"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    clips = state.get("clips") or []
+    candidates = []
+    mapping = {}
+    pool = [clip for clip in clips if clip.get("keep")] or clips
+    for clip in pool:
+        audio_path = resolve_long_session_audio(clip.get("trimmed_path") or clip.get("source_path"), session_dir)
+        if not audio_path:
+            continue
+        clip_id = int(clip.get("id", len(candidates)))
+        text_value = (clip.get("text") or "").strip()
+        preview = text_value if text_value else "<<テキストなし>>"
+        if len(preview) > 28:
+            preview = preview[:28] + "..."
+        label = f"{clip_id:03d} | {clip.get('duration', 0.0):.2f}s | {preview}"
+        mapping[label] = {
+            "audio_path": audio_path,
+            "text": text_value,
+            "duration": clip.get("duration", 0.0),
+            "name": clip.get("name", Path(audio_path).name),
+        }
+        candidates.append(label)
+    if not candidates:
+        return [], {}, f"参照候補に使えるクリップがありません: {session_name}"
+    return candidates, mapping, f"{session_name} から {len(candidates)} 件の参照候補を読み込みました。"
+
+
+def refresh_long_sessions():
+    choices = long_session_options()
+    message = f"long セッションを {len(choices)} 件見つけました。" if choices else "long セッションはまだありません。"
+    return gr.update(choices=choices, value=(choices[0] if choices else None)), message
+
+
+def load_long_session_references(session_choice):
+    choices = long_session_options()
+    candidates, mapping, message = build_long_reference_choices(session_choice)
+    return (
+        gr.update(choices=choices, value=session_choice if session_choice in choices else (choices[0] if choices else None)),
+        mapping,
+        gr.update(choices=candidates, value=(candidates[0] if candidates else None)),
+        message,
+        gr.update(value=(mapping.get(candidates[0], {}).get("audio_path") if candidates else None)),
+    )
+
+
+def preview_long_reference(candidate_choice, reference_map):
+    info = (reference_map or {}).get(candidate_choice or "")
+    if not info:
+        return gr.update(value=None), "参照候補を選んでください。"
+    text_value = info.get("text") or "この候補には保存済みテキストがありません。"
+    return gr.update(value=info.get("audio_path")), f"保存済みテキスト: {text_value}"
+
+
+def apply_long_reference(candidate_choice, reference_map):
+    info = (reference_map or {}).get(candidate_choice or "")
+    if not info:
+        return (
+            gr.update(),
+            gr.update(),
+            gr.update(value=base.i18n("日文")),
+            gr.update(value="long ステートの参照候補を選んでください。"),
+            gr.update(value=False),
+            "参照候補が未選択です。",
+        )
+    stored_text = (info.get("text") or "").strip()
+    if not stored_text:
+        stored_text = "この候補には保存済みテキストがありません。必要なら手動入力してください。"
+    return (
+        gr.update(value=info.get("audio_path")),
+        gr.update(value=stored_text if info.get("text") else ""),
+        gr.update(value=base.i18n("日文")),
+        gr.update(value="long ステートから参照音声と保存済みテキストを適用しました。Whisper 自動書き起こしは使っていません。"),
+        gr.update(value=False),
+        f"参照候補を適用しました: {info.get('name', '')}",
+    )
+
 DEFAULT_CONFIG_TEXT = """# GPT-SoVITS emotion presets\n# neutral は常に UI の speed / top_p / temperature を使います。\n# 他の感情はこのファイルの絶対値を使います。\n\n[neutral]\npitch_shift = 0.0\nspeed = ui\ntop_p = ui\ntemperature = ui\nvolume_gain_db = 0.0\n\n[happy]\npitch_shift = 1.0\nspeed = 1.10\ntop_p = 1.00\ntemperature = 1.00\nvolume_gain_db = 0.5\n\n[surprise]\npitch_shift = 0.5\nspeed = 1.20\ntop_p = 1.00\ntemperature = 1.00\nvolume_gain_db = 0.4\n\n[annoyed]\npitch_shift = 0.5\nspeed = 1.20\ntop_p = 0.70\ntemperature = 0.90\nvolume_gain_db = 1.2\n\n[sorrow]\npitch_shift = -1.0\nspeed = 0.85\ntop_p = 0.90\ntemperature = 0.80\nvolume_gain_db = -0.6\n\n[relax]\npitch_shift = -0.5\nspeed = 0.90\ntop_p = 0.90\ntemperature = 0.85\nvolume_gain_db = -0.2\n"""
 
 
@@ -204,6 +360,44 @@ def build_emotion_ref(audio_path, emotion, out_path, preset):
         raise RuntimeError(result.stderr.strip() or f"{emotion} 参照音声の生成に失敗しました。")
 
 
+def build_padded_reference(audio_path, out_path, silence_sec):
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    ffmpeg_path = ensure_ffmpeg()
+    sample_rate = get_sample_rate(audio_path)
+    silence_sec = max(0.0, float(silence_sec))
+    if silence_sec <= 0:
+        shutil.copy2(audio_path, out_path)
+        return str(out_path)
+    command = [
+        ffmpeg_path,
+        '-y',
+        '-f',
+        'lavfi',
+        '-t',
+        f'{silence_sec:.3f}',
+        '-i',
+        f'anullsrc=r={sample_rate}:cl=mono',
+        '-i',
+        str(audio_path),
+        '-f',
+        'lavfi',
+        '-t',
+        f'{silence_sec:.3f}',
+        '-i',
+        f'anullsrc=r={sample_rate}:cl=mono',
+        '-filter_complex',
+        '[0:a][1:a][2:a]concat=n=3:v=0:a=1[aout]',
+        '-map',
+        '[aout]',
+        str(out_path),
+    ]
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or '参照音声の無音追加に失敗しました。')
+    return str(out_path)
+
+
 def make_session_dir():
     session_id = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     session_dir = Path(ROOT_DIR) / "outputs" / "emotion_sessions" / session_id
@@ -279,8 +473,7 @@ def get_infer_values(emotion, emotion_config, ui_speed, ui_top_p, ui_temperature
         "temperature": float(preset["temperature"]),
     }
 
-
-def split_emotion_refs(audio_path):
+def split_emotion_refs(audio_path, pad_ref_silence, ref_silence_sec):
     if not audio_path:
         return (
             None,
@@ -292,15 +485,20 @@ def split_emotion_refs(audio_path):
         ensure_ffmpeg()
         emotion_config = load_emotion_config()
         session_dir = make_session_dir()
+        source_audio = audio_path
+        if pad_ref_silence:
+            source_audio = build_padded_reference(audio_path, session_dir / "refs" / "reference_padded.wav", ref_silence_sec)
         refs = {}
         for emotion in EMOTIONS:
             out_path = session_dir / "refs" / f"{emotion}.wav"
-            build_emotion_ref(audio_path, emotion, out_path, emotion_config[emotion])
+            build_emotion_ref(source_audio, emotion, out_path, emotion_config[emotion])
             refs[emotion] = str(out_path)
-        manifest = build_manifest(session_dir, audio_path, refs, emotion_config)
+        manifest = build_manifest(session_dir, source_audio, refs, emotion_config)
         manifest_path = session_dir / "manifest.json"
         manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
         status = f"感情参照音声を生成しました: {session_dir}"
+        if pad_ref_silence:
+            status += f" / 参照音声に前後 {float(ref_silence_sec):.1f} 秒の無音を追加"
         return (
             manifest,
             status,
@@ -315,6 +513,7 @@ def split_emotion_refs(audio_path):
             gr.update(value={"error": str(exc)[:200]}),
             *empty_preview_updates(),
         )
+
 
 
 def run_base_tts(
@@ -460,6 +659,7 @@ ensure_emotion_config_file()
 
 with gr.Blocks(title="GPT-SoVITS 1C Emotion Japanese Inference", analytics_enabled=False, js=base.js, css=base.css) as app:
     emotion_state = gr.State(value=None)
+    long_reference_map = gr.State(value={})
     gr.HTML(
         base.top_html.format(
             "GPT-SoVITS 1C 感情推論 UI。参照音声から感情別参照 WAV を生成し、[happy] 形式のタグ付き台本を連続推論します。"
@@ -487,80 +687,104 @@ with gr.Blocks(title="GPT-SoVITS 1C Emotion Japanese Inference", analytics_enabl
             refresh_button.click(fn=base.change_choices, inputs=[], outputs=[SoVITS_dropdown, GPT_dropdown])
 
         gr.Markdown(base.html_center("参照音声と感情分割", "h3"))
-        with gr.Row():
-            inp_ref = gr.Audio(label="参照音声をアップロード (3〜10秒推奨)", type="filepath", scale=13)
-            with gr.Column(scale=13):
-                ref_text_free = gr.Checkbox(
-                    label=base.i18n("开启无参考文本模式。不填参考文本亦相当于开启。")
-                    + base.i18n("v3暂不支持该模式，使用了会报错。"),
-                    value=False,
-                    interactive=True if base.model_version not in base.v3v4set else False,
-                    show_label=True,
-                    scale=1,
-                )
-                gr.Markdown(
-                    base.html_left(
-                        "参照音声は Whisper で自動書き起こしされます。感情設定は emotion_presets.txt から読み込みます。"
-                    )
-                )
-                prompt_text = gr.Textbox(
-                    label="参照音声の書き起こし",
-                    value="",
-                    lines=5,
-                    max_lines=5,
-                    scale=1,
-                    placeholder="参照音声をアップロードすると自動入力されます。",
-                )
-                whisper_status = gr.Textbox(
-                    label="Whisperステータス",
-                    value="参照音声をアップロードすると、ここにWhisperの自動書き起こしを表示します。",
-                    interactive=False,
-                    lines=2,
-                    max_lines=4,
-                )
+        with gr.Tabs():
+            with gr.Tab("アップロード"):
                 with gr.Row():
-                    transcribe_button = gr.Button("Whisperで再書き起こし", variant="secondary")
-                    split_button = gr.Button("感情分割", variant="primary")
-                    open_config_button = gr.Button("Open Config", variant="secondary")
-                split_status = gr.Textbox(label="感情分割ステータス", interactive=False, lines=3)
-            with gr.Column(scale=14):
-                prompt_language = gr.Dropdown(
-                    label="参照音声の言語",
-                    choices=list(base.dict_language.keys()),
-                    value=base.i18n("日文"),
-                )
-                inp_refs = (
-                    gr.File(
-                        label="追加参照音声 (この画面では未使用、既存UI互換のため保持)",
-                        file_count="multiple",
-                        visible=False,
-                    )
-                    if base.model_version not in base.v3v4set
-                    else gr.File(label="追加参照音声", file_count="multiple", visible=False)
-                )
-                sample_steps = (
-                    gr.Radio(
-                        label=base.i18n("采样步数,如果觉得电,提高试试,如果觉得慢,降低试试"),
-                        value=32 if base.model_version == "v3" else 8,
-                        choices=[4, 8, 16, 32, 64, 128] if base.model_version == "v3" else [4, 8, 16, 32],
-                        visible=True,
-                    )
-                    if base.model_version in base.v3v4set
-                    else gr.Radio(
-                        label=base.i18n("采样步数,如果觉得电,提高试试,如果觉得慢,降低试试"),
-                        choices=[4, 8, 16, 32, 64, 128] if base.model_version == "v3" else [4, 8, 16, 32],
-                        visible=False,
-                        value=32 if base.model_version == "v3" else 8,
-                    )
-                )
-                if_sr_Checkbox = gr.Checkbox(
-                    label=base.i18n("v3输出如果觉得闷可以试试开超分"),
-                    value=False,
-                    interactive=True,
-                    show_label=True,
-                    visible=False if base.model_version != "v3" else True,
-                )
-                manifest_view = gr.JSON(label="セッション情報")
+                    inp_ref = gr.Audio(label="参照音声をアップロード (3〜10秒推奨)", type="filepath", scale=13)
+                    with gr.Column(scale=13):
+                        ref_text_free = gr.Checkbox(
+                            label=base.i18n("开启无参考文本模式。不填参考文本亦相当于开启。")
+                            + base.i18n("v3暂不支持该模式，使用了会报错。"),
+                            value=False,
+                            interactive=True if base.model_version not in base.v3v4set else False,
+                            show_label=True,
+                            scale=1,
+                        )
+                        gr.Markdown(
+                            base.html_left(
+                                "参照音声は Whisper で自動書き起こしされます。感情設定は emotion_presets.txt から読み込みます。"
+                            )
+                        )
+                        prompt_text = gr.Textbox(
+                            label="参照音声の書き起こし",
+                            value="",
+                            lines=5,
+                            max_lines=5,
+                            scale=1,
+                            placeholder="参照音声をアップロードすると自動入力されます。",
+                        )
+                        whisper_status = gr.Textbox(
+                            label="Whisperステータス",
+                            value="参照音声をアップロードすると、ここにWhisperの自動書き起こしを表示します。",
+                            interactive=False,
+                            lines=2,
+                            max_lines=4,
+                        )
+                        with gr.Row():
+                            pad_ref_silence = gr.Checkbox(
+                                label="参照音声の前後に無音を足して最低長エラーを回避",
+                                value=True,
+                            )
+                            ref_silence_sec = gr.Dropdown(
+                                label="無音追加秒数",
+                                choices=[0.5, 1.0],
+                                value=0.5,
+                            )
+                        with gr.Row():
+                            transcribe_button = gr.Button("Whisperで再書き起こし", variant="secondary")
+                            split_button = gr.Button("感情分割", variant="primary")
+                            open_config_button = gr.Button("Open Config", variant="secondary")
+                    with gr.Column(scale=14):
+                        prompt_language = gr.Dropdown(
+                            label="参照音声の言語",
+                            choices=list(base.dict_language.keys()),
+                            value=base.i18n("日文"),
+                        )
+                        inp_refs = (
+                            gr.File(
+                                label="追加参照音声 (この画面では未使用、既存UI互換のため保持)",
+                                file_count="multiple",
+                                visible=False,
+                            )
+                            if base.model_version not in base.v3v4set
+                            else gr.File(label="追加参照音声", file_count="multiple", visible=False)
+                        )
+                        sample_steps = (
+                            gr.Radio(
+                                label=base.i18n("采样步数,如果觉得电,提高试试,如果觉得慢,降低试试"),
+                                value=32 if base.model_version == "v3" else 8,
+                                choices=[4, 8, 16, 32, 64, 128] if base.model_version == "v3" else [4, 8, 16, 32],
+                                visible=True,
+                            )
+                            if base.model_version in base.v3v4set
+                            else gr.Radio(
+                                label=base.i18n("采样步数,如果觉得电,提高试试,如果觉得慢,降低试试"),
+                                choices=[4, 8, 16, 32, 64, 128] if base.model_version == "v3" else [4, 8, 16, 32],
+                                visible=False,
+                                value=32 if base.model_version == "v3" else 8,
+                            )
+                        )
+                        if_sr_Checkbox = gr.Checkbox(
+                            label=base.i18n("v3输出如果觉得闷可以试试开超分"),
+                            value=False,
+                            interactive=True,
+                            show_label=True,
+                            visible=False if base.model_version != "v3" else True,
+                        )
+            with gr.Tab("long ステート"):
+                gr.Markdown(base.html_left("長尺学習 UI の保存済み session_state.json から、keep 済みクリップを参照音声候補として選びます。適用時は Whisper 自動書き起こしを使わず、保存済みテキストをそのまま表示します。"))
+                with gr.Row():
+                    long_session_picker = gr.Dropdown(label="long ステート", choices=long_session_options(), value=None, allow_custom_value=False)
+                    refresh_long_sessions_button = gr.Button("一覧を更新", variant="secondary")
+                    load_long_refs_button = gr.Button("候補を読み込む", variant="primary")
+                with gr.Row():
+                    long_ref_choice = gr.Dropdown(label="参照音声候補", choices=[], value=None, allow_custom_value=False, scale=14)
+                    apply_long_ref_button = gr.Button("この候補を参照音声に適用", variant="primary", scale=7)
+                with gr.Row():
+                    long_ref_preview = gr.Audio(label="候補プレビュー", type="filepath", scale=12)
+                    long_ref_status = gr.Textbox(label="long ステート候補の状態", interactive=False, lines=5, scale=12)
+        split_status = gr.Textbox(label="感情分割ステータス", interactive=False, lines=3)
+        manifest_view = gr.JSON(label="感情分割 / 推論 manifest")
 
         with gr.Row():
             preview_components = []
@@ -663,7 +887,7 @@ with gr.Blocks(title="GPT-SoVITS 1C Emotion Japanese Inference", analytics_enabl
         )
         split_button.click(
             split_emotion_refs,
-            [inp_ref],
+            [inp_ref, pad_ref_silence, ref_silence_sec],
             [emotion_state, split_status, manifest_view, *preview_components],
         )
         open_config_button.click(open_emotion_config, [], [split_status])
@@ -701,6 +925,26 @@ with gr.Blocks(title="GPT-SoVITS 1C Emotion Japanese Inference", analytics_enabl
             [prompt_text, prompt_language, whisper_status, ref_text_free],
         )
 
+        refresh_long_sessions_button.click(
+            refresh_long_sessions,
+            [],
+            [long_session_picker, long_ref_status],
+        )
+        load_long_refs_button.click(
+            load_long_session_references,
+            [long_session_picker],
+            [long_session_picker, long_reference_map, long_ref_choice, long_ref_status, long_ref_preview],
+        )
+        long_ref_choice.change(
+            preview_long_reference,
+            [long_ref_choice, long_reference_map],
+            [long_ref_preview, long_ref_status],
+        )
+        apply_long_ref_button.click(
+            apply_long_reference,
+            [long_ref_choice, long_reference_map],
+            [inp_ref, prompt_text, prompt_language, whisper_status, ref_text_free, split_status],
+        )
 if __name__ == "__main__":
     app.queue().launch(
         server_name="0.0.0.0",
@@ -708,3 +952,5 @@ if __name__ == "__main__":
         share=base.is_share,
         server_port=base.infer_ttswebui,
     )
+
+

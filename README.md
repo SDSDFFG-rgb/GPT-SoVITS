@@ -66,6 +66,13 @@ For users in China, you can [click here](https://www.codewithgpu.com/i/RVC-Boss/
 | Python 3.11    | PyTorch 2.7.0    | Apple silicon |
 | Python 3.9     | PyTorch 2.2.2    | CPU           |
 
+### Local Custom Notes
+
+- The Japanese long-form training UI can optionally use NVIDIA Maxine denoise.
+- Maxine runtime files are not tracked in this repository.
+- If you want that feature, place the extracted runtime at `D:\gpt-sovits\Maxine-AFX-Runtime` outside the repo.
+- If the runtime is missing, the long-form UI continues without Maxine.
+
 ### Windows
 
 If you are a Windows user (tested with win>=10), you can [download the integrated package](https://huggingface.co/lj1995/GPT-SoVITS-windows-package/resolve/main/GPT-SoVITS-v3lora-20250228.7z?download=true) and double-click on _go-webui.bat_ to start GPT-SoVITS-WebUI.
@@ -128,7 +135,14 @@ sudo apt install ffmpeg
 sudo apt install libsox-dev
 ```
 
-##### Windows Users
+##### Local Custom Notes
+
+- The Japanese long-form training UI can optionally use NVIDIA Maxine denoise.
+- Maxine runtime files are not tracked in this repository.
+- If you want that feature, place the extracted runtime at `D:\gpt-sovits\Maxine-AFX-Runtime` outside the repo.
+- If the runtime is missing, the long-form UI continues without Maxine.
+
+### Windows Users
 
 Download and place [ffmpeg.exe](https://huggingface.co/lj1995/VoiceConversionWebUI/blob/main/ffmpeg.exe) and [ffprobe.exe](https://huggingface.co/lj1995/VoiceConversionWebUI/blob/main/ffprobe.exe) in the GPT-SoVITS root
 
@@ -476,3 +490,4 @@ Thankful to @Naozumi520 for providing the Cantonese training set and for the gui
 <a href="https://github.com/RVC-Boss/GPT-SoVITS/graphs/contributors" target="_blank">
   <img src="https://contrib.rocks/image?repo=RVC-Boss/GPT-SoVITS" />
 </a>
+
