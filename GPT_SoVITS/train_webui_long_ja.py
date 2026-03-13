@@ -49,10 +49,11 @@ SESSION_ROOT.mkdir(parents=True, exist_ok=True)
 TEMP_ROOT = ROOT_DIR / "TEMP" / "minute_training"
 TEMP_ROOT.mkdir(parents=True, exist_ok=True)
 SUPPORTED_VERSIONS = ["v1", "v2", "v4", "v2Pro", "v2ProPlus"]
-DEFAULT_VERSION = os.environ.get("version", "v2Pro")
+DEFAULT_VERSION = os.environ.get("version", "v4")
 CURRENT_PROCESS = None
 CURRENT_PROCESS_NAME = ""
 WHISPER_MODEL = None
+WHISPER_MODEL_NAME = None
 SESSION_KIND = 'long'
 
 
@@ -332,9 +333,7 @@ def materialize_session(state, save_name, speaker_name, language_code):
     return migrated, True
 
 
-def clone_current_session(state, save_name, speaker_name, language_code):
-    if not state or not state.get('session_dir'):
-        return None, '先に複製元のセッションを読み込んでください。', [], [], [], {}, '', '', maxine_status_text(detect_maxine_assets()), gr.update(choices=session_options(), value=None)
+def build_cloned_session(state, save_name, speaker_name, language_code):
     new_state = ensure_session(save_name, speaker_name, language_code, temporary=False)
     old_dir = Path(state['session_dir'])
     new_dir = Path(new_state['session_dir'])
@@ -365,11 +364,64 @@ def clone_current_session(state, save_name, speaker_name, language_code):
                     rows.append(row)
             list_path.write_text('\n'.join(rows) + ('\n' if rows else ''), encoding='utf-8')
     save_state(cloned)
+    return cloned, str(old_dir), new_dir
+
+
+def apply_editor_values_to_state(state, values, source_session_dir=None):
+    expected = len(state['clips']) * 3
+    if len(values) != expected:
+        raise ValueError('編集欄の数が一致しません。画面を再読み込みしてもう一度試してください。')
+    idx = 0
+    transcript_dir = Path(state['session_dir']) / 'transcripts'
+    transcript_dir.mkdir(parents=True, exist_ok=True)
+    for clip in state['clips']:
+        audio_path = values[idx]
+        text_value = values[idx + 1]
+        keep_value = values[idx + 2]
+        resolved_audio_path = ''
+        if audio_path:
+            resolved_audio_path = str(audio_path)
+            if source_session_dir and resolved_audio_path.startswith(source_session_dir):
+                remapped = resolved_audio_path.replace(source_session_dir, state['session_dir'], 1)
+                if Path(remapped).exists():
+                    resolved_audio_path = remapped
+        clip['trimmed_path'] = resolved_audio_path or clip.get('trimmed_path', '')
+        clip['text'] = (text_value or '').strip()
+        clip['keep'] = bool(keep_value)
+        (transcript_dir / f"{clip['id']:03d}.txt").write_text((clip['text'] + '\n') if clip['text'] else '', encoding='utf-8')
+        idx += 3
+    save_state(state)
+    kept = sum(1 for clip in state['clips'] if clip['keep'])
+    filled = sum(1 for clip in state['clips'] if clip['text'])
+    return kept, filled
+
+
+def clone_current_session(state, save_name, speaker_name, language_code):
+    if not state or not state.get('session_dir'):
+        return None, '先に複製元のセッションを読み込んでください。', [], [], [], {}, '', '', maxine_status_text(detect_maxine_assets()), gr.update(choices=session_options(), value=None)
+    cloned, old_dir, new_dir = build_cloned_session(state, save_name, speaker_name, language_code)
     choices = session_options()
     selected = next((choice for choice in choices if choice.endswith('| ' + new_dir.name)), None)
-    message = f'新しいセッションとして保存しました: {new_dir.name}'
+    message = f'保存済みの内容を新しいセッションとして保存しました: {new_dir.name}'
     ds = cloned.get('dataset', {})
     return cloned, message, source_rows(cloned), clip_rows(cloned), skipped_rows(cloned), state_summary(cloned), ds.get('list_path', ''), ds.get('wav_dir', ''), maxine_status_text(cloned.get('maxine_status')), gr.update(choices=choices, value=selected)
+
+
+def clone_current_session_with_rows(state, save_name, speaker_name, language_code, *values):
+    if not state or not state.get('session_dir'):
+        return None, '先に複製元のセッションを読み込んでください。', [], [], [], {}, '', '', maxine_status_text(detect_maxine_assets()), gr.update(choices=session_options(), value=None)
+    try:
+        cloned, old_dir, new_dir = build_cloned_session(state, save_name, speaker_name, language_code)
+        kept, filled = apply_editor_values_to_state(cloned, values, source_session_dir=old_dir)
+        choices = session_options()
+        selected = next((choice for choice in choices if choice.endswith('| ' + new_dir.name)), None)
+        ds = cloned.get('dataset', {})
+        message = f'編集内容を反映して新しいセッションとして保存しました: {new_dir.name} 採用 {kept} 件 / テキスト入力済み {filled} 件。'
+        return cloned, message, source_rows(cloned), clip_rows(cloned), skipped_rows(cloned), state_summary(cloned), ds.get('list_path', ''), ds.get('wav_dir', ''), maxine_status_text(cloned.get('maxine_status')), gr.update(choices=choices, value=selected)
+    except Exception as exc:
+        ds = (state or {}).get('dataset', {})
+        return state, f'別セッション保存に失敗しました: {exc}', source_rows(state), clip_rows(state), skipped_rows(state), state_summary(state), ds.get('list_path', ''), ds.get('wav_dir', ''), maxine_status_text((state or {}).get('maxine_status')), gr.update(choices=session_options(), value=None)
+
 def load_saved_session(session_name):
     session_name = session_name_from_choice(session_name)
     choices = session_options()
@@ -439,20 +491,38 @@ def load_files(files, save_name, speaker_name, language_code):
     return editor_outputs(state, f'{len(clips)} 個の音声を読み込みました。Whisper で書き起こしを実行してください。')
 
 
-def get_whisper_model():
-    global WHISPER_MODEL
-    if WHISPER_MODEL is None:
-        model_name = os.environ.get('reference_whisper_model', 'turbo')
+def get_whisper_model(model_name=None):
+    global WHISPER_MODEL, WHISPER_MODEL_NAME
+    model_name = model_name or os.environ.get('reference_whisper_model', 'turbo')
+    if WHISPER_MODEL is None or WHISPER_MODEL_NAME != model_name:
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
         compute_type = 'float16' if device == 'cuda' else 'int8'
         WHISPER_MODEL = WhisperModel(model_name, device=device, compute_type=compute_type)
+        WHISPER_MODEL_NAME = model_name
     return WHISPER_MODEL
 
 
-def prepare_whisper():
-    get_whisper_model()
-    model_name = os.environ.get('reference_whisper_model', 'turbo')
+def prepare_whisper(model_name=None):
+    model_name = model_name or os.environ.get('reference_whisper_model', 'turbo')
+    os.environ['reference_whisper_model'] = model_name
+    get_whisper_model(model_name)
     return f'Whisper モデルを準備しました: {model_name}'
+
+
+def prepare_anime_whisper():
+    return prepare_whisper('quantumcookie/anime-whisper-ct2')
+def prepare_whisper_selection(whisper_choice):
+    if whisper_choice == 'anime-whisper':
+        return prepare_anime_whisper()
+    return prepare_whisper('turbo')
+
+
+def run_command(args, *, cwd=None, env=None, process_name='command'):
+    proc = subprocess.run(args, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='replace')
+    if proc.returncode != 0:
+        tail = (proc.stderr or proc.stdout or '').strip()
+        raise RuntimeError(f'[{process_name}] ' + tail[-2000:])
+    return proc.stdout, proc.stderr
 
 
 def transcribe_clip_with_whisper(audio_path):
@@ -470,9 +540,14 @@ def transcribe_clip_with_whisper(audio_path):
 
 
 def transcribe_all(state):
-    if not state or not state.get('clips'):
-        return editor_outputs(state, '先に音声を読み込んでください。')
+    if not state or not state.get('sources'):
+        return editor_outputs(state, '先に素材を読み込んでください。')
     try:
+        if not state.get('clips'):
+            ok, message = ensure_source_audio_prepared(state)
+            if not ok:
+                return editor_outputs(state, message)
+            rebuild_clips_from_sources(state)
         transcript_dir = Path(state['session_dir']) / 'transcripts'
         transcript_dir.mkdir(parents=True, exist_ok=True)
         summaries = []
@@ -492,90 +567,26 @@ def transcribe_all(state):
                 success_count += 1
             else:
                 empty_count += 1
-        session_state_path = Path(state['session_dir']) / 'session_state.json'
-        session_state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding='utf-8')
+        save_state(state)
         summary_text = '\n'.join(summaries[:12])
         if len(summaries) > 12:
             summary_text += f"\n- 他 {len(summaries) - 12} 件"
-        message = (
-            f"Whisper 書き起こし完了: {success_count}/{len(state['clips'])} 件。空文字 {empty_count} 件。  \\n"
-            f"保存先: {transcript_dir}  \\n"
-            f"{summary_text}"
-        )
+        message = f"Whisper 書き起こし完了: {success_count}/{len(state['clips'])} 件。空文字 {empty_count} 件。  \\n保存先: {transcript_dir}  \\n{summary_text}"
         return editor_outputs(state, message)
     except Exception as exc:
         traceback.print_exc()
         return editor_outputs(state, f'Whisper 書き起こしに失敗しました: {exc}')
-
-
-def save_clip(state, choice, trim_start, trim_end, text, keep):
-    if not state or not state.get('clips'):
-        return editor_outputs(state, '先に音声を読み込んでください。')
-    clip = find_clip(state, choice)
-    edited = Path(state['session_dir']) / 'edited' / f"{clip['id']:03d}.wav"
-    audio, sr = torchaudio.load(clip['source_path'])
-    start_frame = max(0, int(float(trim_start) * sr))
-    end_frame = min(audio.shape[1], int(float(trim_end) * sr))
-    if end_frame <= start_frame:
-        return editor_outputs(state, '終了位置は開始位置より後ろにしてください。')
-    torchaudio.save(str(edited), audio[:, start_frame:end_frame], sr)
-    clip['trim_start'] = round(float(trim_start), 4)
-    clip['trim_end'] = round(float(trim_end), 4)
-    clip['trimmed_path'] = str(edited)
-    clip['text'] = (text or '').strip()
-    clip['keep'] = bool(keep)
-    return editor_outputs(state, f"{clip['name']} の編集を保存しました。")
-
-
 def save_editor_rows(state, *values):
     if not state or not state.get('clips'):
-        return editor_outputs(state, '先に音声を読み込んでください。')
-    expected = len(state['clips']) * 3
-    if len(values) != expected:
-        return state, '編集欄の数が一致しません。画面を再読み込みしてもう一度試してください。', clip_rows(state), state_summary(state)
-    idx = 0
-    for clip in state['clips']:
-        audio_path = values[idx]
-        text_value = values[idx + 1]
-        keep_value = values[idx + 2]
-        clip['trimmed_path'] = str(audio_path) if audio_path else clip.get('trimmed_path', '')
-        clip['text'] = (text_value or '').strip()
-        clip['keep'] = bool(keep_value)
-        idx += 3
-    session_state_path = Path(state['session_dir']) / 'session_state.json'
-    session_state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding='utf-8')
-    kept = sum(1 for clip in state['clips'] if clip['keep'])
-    filled = sum(1 for clip in state['clips'] if clip['text'])
+        return state, '先に Whisper 書き起こしか無音分割を実行してください。', clip_rows(state), state_summary(state)
+    old_session_dir = state.get('session_dir', '')
+    state, materialized = materialize_session(state, state.get('save_name', 'long_train_ja'), state.get('speaker_name', ''), state.get('language_code', 'ja'))
+    try:
+        kept, filled = apply_editor_values_to_state(state, values, source_session_dir=(old_session_dir if materialized else None))
+    except Exception as exc:
+        return state, str(exc), clip_rows(state), state_summary(state)
     prefix = '新規保存しました。' if materialized else '一覧の編集を保存しました。'
-    return state, f'{prefix} 採用 {kept} 件 / テキスト入力済み {filled} 件。', clip_rows(state), state_summary(state)
-
-
-def export_dataset(state, save_name, speaker_name, language_code):
-    if not state or not state.get('clips'):
-        return editor_outputs(state, '先に音声を読み込んでください。')
-    state['save_name'] = sanitize_name(save_name)
-    state['speaker_name'] = derive_speaker(save_name, speaker_name)
-    state['language_code'] = (language_code or 'ja').strip() or 'ja'
-    dataset_dir = Path(state['session_dir']) / 'dataset'
-    audio_dir = dataset_dir / 'audio'
-    audio_dir.mkdir(parents=True, exist_ok=True)
-    rows = []
-    for clip in state['clips']:
-        if not clip['keep'] or not clip['text'].strip():
-            continue
-        src = clip['trimmed_path'] or clip['source_path']
-        dst = audio_dir / f"{clip['id']:03d}.wav"
-        shutil.copy2(src, dst)
-        rows.append(f"{dst.name}|{state['speaker_name']}|{state['language_code']}|{clip['text'].strip()}")
-    if not rows:
-        return editor_outputs(state, '採用クリップとテキストが必要です。')
-    list_path = dataset_dir / 'annotations.list'
-    list_path.write_text('\n'.join(rows) + '\n', encoding='utf-8')
-    session_json = dataset_dir / 'session.json'
-    session_json.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding='utf-8')
-    state['dataset'] = {'list_path': str(list_path), 'wav_dir': str(audio_dir), 'session_json': str(session_json)}
-    return editor_outputs(state, f'学習フォーマットを生成しました。採用クリップ数: {len(rows)}')
-
+    return state, f'{prefix} 採用 {kept} 件 / テキスト入力済み {filled} 件。保存先: {Path(state["session_dir"]) / "session_state.json"}', clip_rows(state), state_summary(state)
 
 def default_weight(mapping, version):
     if isinstance(mapping, dict):
@@ -775,7 +786,7 @@ def run_sovits_training(state, version, gpu_number, batch_size, total_epoch, sav
     Path(data['save_weight_dir']).mkdir(parents=True, exist_ok=True)
     data['name'] = exp_name
     data['version'] = version
-    tmp_config = TEMP_ROOT / 'tmp_s2_1m.json'
+    tmp_config = TEMP_ROOT / 'tmp_s2_long.json'
     tmp_config.write_text(json.dumps(data, ensure_ascii=False), encoding='utf-8')
     python = f'"{sys.executable}"'
     script = 'GPT_SoVITS/s2_train.py' if version in ['v1', 'v2', 'v2Pro', 'v2ProPlus'] else 'GPT_SoVITS/s2_train_v3_lora.py'
@@ -806,7 +817,7 @@ def run_gpt_training(state, version, gpu_number, batch_size, total_epoch, save_e
     data['train_semantic_path'] = str(s1_dir / '6-name2semantic.tsv')
     data['train_phoneme_path'] = str(s1_dir / '2-name2text.txt')
     data['output_dir'] = str(s1_dir / f'logs_s1_{version}')
-    tmp_config = TEMP_ROOT / 'tmp_s1_1m.yaml'
+    tmp_config = TEMP_ROOT / 'tmp_s1_long.yaml'
     tmp_config.write_text(yaml.dump(data, default_flow_style=False, allow_unicode=True), encoding='utf-8')
     python = f'"{sys.executable}"'
     env = {'_CUDA_VISIBLE_DEVICES': str(fix_gpu_number(gpu_number)), 'hz': '25hz', 'version': version, 'is_half': str(is_half)}
@@ -824,8 +835,64 @@ def latest_weight_map(version):
     return result
 
 
+def latest_exp_weight(root, exp_name, suffix):
+    root = Path(root)
+    if not exp_name or not root.exists():
+        return ''
+    matches = sorted(root.glob(f'{exp_name}*{suffix}'), key=lambda p: p.stat().st_mtime, reverse=True)
+    return str(matches[0]) if matches else ''
+
+
+def experiment_weight_map(version, exp_name):
+    return {
+        'sovits': latest_exp_weight(SoVITS_weight_version2root[version], exp_name, '.pth'),
+        'gpt': latest_exp_weight(GPT_weight_version2root[version], exp_name, '.ckpt'),
+    }
+
+
+def cleanup_training_artifacts(state, version, keep_weights=None):
+    exp_name = sanitize_name((state or {}).get('save_name', ''))
+    if not exp_name:
+        return []
+    keep_weights = keep_weights or experiment_weight_map(version, exp_name)
+    removed = []
+    log_dir = Path(exp_root) / exp_name
+    if log_dir.exists():
+        shutil.rmtree(log_dir, ignore_errors=True)
+        removed.append(str(log_dir))
+    for key, root_dir, suffix in [('sovits', SoVITS_weight_version2root[version], '.pth'), ('gpt', GPT_weight_version2root[version], '.ckpt')]:
+        keep_path = keep_weights.get(key, '')
+        keep_resolved = str(Path(keep_path).resolve()) if keep_path else ''
+        root = Path(root_dir)
+        if not root.exists():
+            continue
+        for candidate in root.glob(f'{exp_name}*{suffix}'):
+            candidate_resolved = str(candidate.resolve())
+            if keep_resolved and candidate_resolved == keep_resolved:
+                continue
+            candidate.unlink(missing_ok=True)
+            removed.append(str(candidate))
+    return removed
+
+
+def maybe_cleanup_after_training(state, version, cleanup_after_train):
+    exp_name = sanitize_name((state or {}).get('save_name', ''))
+    exp_weights = experiment_weight_map(version, exp_name)
+    latest_weights = {
+        'sovits': exp_weights['sovits'] or (state or {}).get('latest_weights', {}).get('sovits', ''),
+        'gpt': exp_weights['gpt'] or (state or {}).get('latest_weights', {}).get('gpt', ''),
+    }
+    state['latest_weights'] = latest_weights
+    if not cleanup_after_train:
+        return state, ''
+    if not latest_weights['sovits'] or not latest_weights['gpt']:
+        return state, ' 自動整理はスキップしました。推論用の SoVITS/GPT 重みが両方そろった後にだけ削除します。'
+    removed = cleanup_training_artifacts(state, version, latest_weights)
+    return state, f' 自動整理を実行しました。削除対象: {len(removed)} 件。'
+
+
 def refresh_latest_weights(state, version):
-    state = state or ensure_session('minute_train', '', 'ja')
+    state = state or ensure_session('long_train', '', 'ja')
     state['latest_weights'] = latest_weight_map(version)
     return state, state_summary(state)
 
@@ -857,187 +924,61 @@ def preprocess_action(state, version, gpu_number, bert_dir, ssl_dir, pretrained_
         return state, f'前処理に失敗しました: {exc}', state_summary(state or {}), traceback.format_exc()
 
 
-def sovits_action(state, version, gpu_number, batch_size, total_epoch, save_every_epoch, if_save_latest, if_save_every_weights, text_low_lr_rate, if_grad_ckpt, lora_rank, pretrained_s2g, pretrained_s2d):
+def sovits_action(state, version, gpu_number, batch_size, total_epoch, save_every_epoch, if_save_latest, if_save_every_weights, cleanup_after_train, text_low_lr_rate, if_grad_ckpt, lora_rank, pretrained_s2g, pretrained_s2d):
     try:
         log = run_sovits_training(state, version, gpu_number, batch_size, total_epoch, save_every_epoch, if_save_latest, if_save_every_weights, text_low_lr_rate, if_grad_ckpt, lora_rank, pretrained_s2g, pretrained_s2d)
-        state['latest_weights'] = latest_weight_map(version)
-        return state, 'SoVITS 学習が完了しました。', state_summary(state), log
+        state, cleanup_note = maybe_cleanup_after_training(state, version, cleanup_after_train)
+        return state, f'SoVITS 学習が完了しました。{cleanup_note}'.strip(), state_summary(state), log
     except Exception as exc:
         traceback.print_exc()
         return state, f'SoVITS 学習に失敗しました: {exc}', state_summary(state or {}), traceback.format_exc()
 
 
-def gpt_action(state, version, gpu_number, batch_size, total_epoch, save_every_epoch, if_save_latest, if_save_every_weights, if_dpo, pretrained_s1):
+def gpt_action(state, version, gpu_number, batch_size, total_epoch, save_every_epoch, if_save_latest, if_save_every_weights, cleanup_after_train, if_dpo, pretrained_s1):
     try:
         log = run_gpt_training(state, version, gpu_number, batch_size, total_epoch, save_every_epoch, if_save_latest, if_save_every_weights, if_dpo, pretrained_s1)
-        state['latest_weights'] = latest_weight_map(version)
-        return state, 'GPT 学習が完了しました。', state_summary(state), log
+        state, cleanup_note = maybe_cleanup_after_training(state, version, cleanup_after_train)
+        return state, f'GPT 学習が完了しました。{cleanup_note}'.strip(), state_summary(state), log
     except Exception as exc:
         traceback.print_exc()
         return state, f'GPT 学習に失敗しました: {exc}', state_summary(state or {}), traceback.format_exc()
 
 
-def full_pipeline_action(state, version, gpu_number, bert_dir, ssl_dir, pretrained_s2g, sv_path, sovits_batch_size, sovits_epoch, save_every_epoch, if_save_latest, if_save_every_weights, text_low_lr_rate, if_grad_ckpt, lora_rank, pretrained_s2d, gpt_batch_size, gpt_epoch, if_dpo, pretrained_s1):
+def full_pipeline_action(state, version, gpu_number, bert_dir, ssl_dir, pretrained_s2g, sv_path, sovits_batch_size, sovits_epoch, save_every_epoch, if_save_latest, if_save_every_weights, cleanup_after_train, text_low_lr_rate, if_grad_ckpt, lora_rank, pretrained_s2d, gpt_batch_size, gpt_epoch, if_dpo, pretrained_s1):
     try:
         parts = []
         prep_log, _ = run_preprocess(state, version, gpu_number, bert_dir, ssl_dir, pretrained_s2g, sv_path)
         parts.append(prep_log)
         parts.append(run_sovits_training(state, version, gpu_number, sovits_batch_size, sovits_epoch, save_every_epoch, if_save_latest, if_save_every_weights, text_low_lr_rate, if_grad_ckpt, lora_rank, pretrained_s2g, pretrained_s2d))
         parts.append(run_gpt_training(state, version, gpu_number, gpt_batch_size, gpt_epoch, save_every_epoch, if_save_latest, if_save_every_weights, if_dpo, pretrained_s1))
-        state['latest_weights'] = latest_weight_map(version)
-        return state, '前処理から学習まで完了しました。', state_summary(state), '\n\n'.join(parts)
+        state, cleanup_note = maybe_cleanup_after_training(state, version, cleanup_after_train)
+        return state, f'前処理から学習まで完了しました。{cleanup_note}'.strip(), state_summary(state), '\n\n'.join(parts)
     except Exception as exc:
         traceback.print_exc()
         return state, f'一括実行に失敗しました: {exc}', state_summary(state or {}), traceback.format_exc()
 
 
-def version_defaults(version):
-    return (
-        default_weight(pretrained_sovits_name, version),
-        default_weight(pretrained_gpt_name, version),
-    )
-
 DEFAULT_BERT_DIR = 'GPT_SoVITS/pretrained_models/chinese-roberta-wwm-ext-large'
 DEFAULT_SSL_DIR = 'GPT_SoVITS/pretrained_models/chinese-hubert-base'
 DEFAULT_SV_PATH = 'GPT_SoVITS/pretrained_models/sv/pretrained_eres2netv2w24s4ep4.ckpt'
-DEFAULT_PORT = int(os.environ.get('minute_train_webui', '9878'))
-
-
-
-MAXINE_CACHE = None
 AUDIO_EXTS = {'.wav', '.mp3', '.flac', '.m4a', '.aac', '.ogg', '.opus', '.wma'}
 VIDEO_EXTS = {'.mp4', '.mkv', '.mov', '.webm', '.avi', '.m4v'}
 SUPPORTED_UPLOAD_EXTS = sorted(AUDIO_EXTS | VIDEO_EXTS)
-MAXINE_RUNTIME_BIN = ROOT_DIR.parent / 'Maxine-AFX-Runtime' / 'nv' / 'bin'
-MAXINE_MODELS_ROOT = MAXINE_RUNTIME_BIN / 'models'
-MAXINE_EFFECTS_DEMO = ROOT_DIR.parent / 'Maxine-AFX-Runtime' / 'tools' / 'effects_demo.exe'
 SPLIT_PROFILES = {
     '標準': {'noise': '-35dB', 'duration': 0.35},
     '保守的': {'noise': '-32dB', 'duration': 0.5},
     '積極的': {'noise': '-38dB', 'duration': 0.25},
 }
+DEFAULT_SILENCE_DURATION_SEC = SPLIT_PROFILES['標準']['duration']
 DEFAULT_PORT = int(os.environ.get('long_train_webui', '9879'))
+MAXINE_CACHE = None
+MAXINE_RUNTIME_BIN = ROOT_DIR.parent / 'Maxine-AFX-Runtime' / 'nv' / 'bin'
+MAXINE_MODELS_ROOT = MAXINE_RUNTIME_BIN / 'models'
+MAXINE_EFFECTS_DEMO = ROOT_DIR.parent / 'Maxine-AFX-Runtime' / 'tools' / 'effects_demo.exe'
 
 
 def source_kind(path):
     return 'video' if Path(path).suffix.lower() in VIDEO_EXTS else 'audio'
-
-def maxine_dependency_dirs(dll_path):
-    dll_dir = Path(dll_path).parent
-    runtime_root = dll_dir.parent
-    return [
-        str(runtime_root),
-        str(dll_dir),
-        str(dll_dir / 'external' / 'cuda' / 'bin'),
-        str(dll_dir / 'external' / 'nvtrt' / 'bin'),
-        str(dll_dir / 'external' / 'openssl' / 'bin'),
-    ]
-
-
-def maxine_export_available(dll_path):
-    if platform.system() != 'Windows':
-        return False, 'Windows 以外では未対応です。'
-    required_exports = ['NvAFX_GetEffectList', 'NvAFX_GetFloatList']
-    old_path = os.environ.get('PATH', '')
-    dep_dirs = [p for p in maxine_dependency_dirs(dll_path) if Path(p).exists()]
-    handles = []
-    if dep_dirs:
-        os.environ['PATH'] = os.pathsep.join(dep_dirs + [old_path]) if old_path else os.pathsep.join(dep_dirs)
-        add_dir = getattr(os, 'add_dll_directory', None)
-        if add_dir is not None:
-            for dep_dir in dep_dirs:
-                try:
-                    handles.append(add_dir(dep_dir))
-                except Exception:
-                    pass
-    try:
-        lib = ctypes.WinDLL(str(dll_path))
-        missing = []
-        for export_name in required_exports:
-            try:
-                getattr(lib, export_name)
-            except Exception:
-                missing.append(export_name)
-        if missing:
-            return False, '不足エクスポート: ' + ', '.join(missing)
-        return True, ''
-    except Exception as exc:
-        return False, str(exc)
-    finally:
-        for handle in handles:
-            try:
-                handle.close()
-            except Exception:
-                pass
-        os.environ['PATH'] = old_path
-
-
-def detect_maxine_assets(force=False):
-    global MAXINE_CACHE
-    if MAXINE_CACHE is not None and not force:
-        return dict(MAXINE_CACHE)
-    status = {
-        'available': False,
-        'reason': '',
-        'effects_demo': str(MAXINE_EFFECTS_DEMO),
-        'model_path': '',
-        'dll_dir': '',
-        'dll_path': '',
-        'version': '',
-    }
-    if not MAXINE_EFFECTS_DEMO.exists():
-        status['reason'] = f'effects_demo.exe が見つかりません: {MAXINE_EFFECTS_DEMO}'
-        MAXINE_CACHE = status
-        return dict(status)
-    if not MAXINE_RUNTIME_BIN.exists():
-        status['reason'] = f'AFX ランタイムが見つかりません: {MAXINE_RUNTIME_BIN}'
-        MAXINE_CACHE = status
-        return dict(status)
-    if not MAXINE_MODELS_ROOT.exists():
-        status['reason'] = f'AFX モデルディレクトリが見つかりません: {MAXINE_MODELS_ROOT}'
-        MAXINE_CACHE = status
-        return dict(status)
-
-    dll_path = MAXINE_RUNTIME_BIN / 'NVAudioEffects.dll'
-    model_path = MAXINE_MODELS_ROOT / 'denoiser_48k.trtpkg'
-    if not dll_path.exists():
-        status['reason'] = f'AFX DLL が見つかりません: {dll_path}'
-        MAXINE_CACHE = status
-        return dict(status)
-    if not model_path.exists():
-        status['reason'] = f'AFX モデルが見つかりません: {model_path}'
-        MAXINE_CACHE = status
-        return dict(status)
-
-    ok, reason = maxine_export_available(dll_path)
-    if not ok:
-        status['reason'] = f'AFX DLL を読み込めません: {reason}'
-        MAXINE_CACHE = status
-        return dict(status)
-
-    status.update({
-        'available': True,
-        'reason': '',
-        'model_path': str(model_path),
-        'dll_dir': str(MAXINE_RUNTIME_BIN),
-        'dll_path': str(dll_path),
-        'version': '1.6.1.2-GA-Ada',
-    })
-    MAXINE_CACHE = status
-    return dict(status)
-
-
-def maxine_status_text(status):
-    if not status:
-        return 'Maxine 状態: 未確認'
-    if status.get('available'):
-        return (
-            'Maxine 状態: 利用可能  \\n'
-            f'- モデル: `{status.get("model_path", "")}`  \\n'
-            f'- DLL: `{status.get("dll_dir", "")}`  \\n'
-            f'- 実行ファイル: `{status.get("effects_demo", "")}`'
-        )
-    return f'Maxine 状態: 利用不可  \\n- 理由: {status.get("reason", "不明")}'
 
 
 def save_state(state):
@@ -1063,6 +1004,7 @@ def ensure_session(save_name, speaker_name, language_code, temporary=False):
         'dataset': {},
         'latest_weights': {},
         'split_profile': '標準',
+        'silence_duration_sec': DEFAULT_SILENCE_DURATION_SEC,
         'min_duration_sec': 3.0,
         'maxine_status': detect_maxine_assets(),
         'session_kind': SESSION_KIND,
@@ -1073,12 +1015,7 @@ def ensure_session(save_name, speaker_name, language_code, temporary=False):
 def source_rows(state):
     rows = []
     for source in (state or {}).get('sources', []):
-        rows.append([
-            source['id'], source.get('kind', ''), source['name'],
-            f"{source.get('duration', 0.0):.2f}" if source.get('duration') else '',
-            '済' if source.get('extracted_audio_path') else '未',
-            '済' if source.get('maxine_applied') else '未',
-        ])
+        rows.append([source['id'], source.get('kind', ''), source['name'], f"{source.get('duration', 0.0):.2f}" if source.get('duration') else '', '済' if source.get('extracted_audio_path') else '未', '済' if source.get('maxine_applied') else '未'])
     return rows
 
 
@@ -1092,12 +1029,7 @@ def clip_rows(state):
 def skipped_rows(state):
     rows = []
     for clip in (state or {}).get('skipped_clips', []):
-        rows.append([
-            clip.get('source_name', ''),
-            f"{clip.get('segment_start', 0.0):.2f} - {clip.get('segment_end', 0.0):.2f}",
-            f"{clip.get('duration', 0.0):.2f}",
-            clip.get('reason', ''),
-        ])
+        rows.append([clip.get('source_name', ''), f"{clip.get('segment_start', 0.0):.2f} - {clip.get('segment_end', 0.0):.2f}", f"{clip.get('duration', 0.0):.2f}", clip.get('reason', '')])
     return rows
 
 
@@ -1115,6 +1047,7 @@ def state_summary(state):
         'kept_count': sum(1 for c in state.get('clips', []) if c.get('keep')),
         'skipped_count': len(state.get('skipped_clips', [])),
         'split_profile': state.get('split_profile', '標準'),
+        'silence_duration_sec': state.get('silence_duration_sec', DEFAULT_SILENCE_DURATION_SEC),
         'min_duration_sec': state.get('min_duration_sec', 3.0),
         'maxine': state.get('maxine_status', {}),
         'list_path': ds.get('list_path', ''),
@@ -1126,24 +1059,14 @@ def state_summary(state):
 
 def editor_outputs(state, message=''):
     ds = (state or {}).get('dataset', {})
-    return (
-        state,
-        message,
-        source_rows(state),
-        clip_rows(state),
-        skipped_rows(state),
-        state_summary(state),
-        ds.get('list_path', ''),
-        ds.get('wav_dir', ''),
-        maxine_status_text((state or {}).get('maxine_status')),
-    )
+    return (state, message, source_rows(state), clip_rows(state), skipped_rows(state), state_summary(state), ds.get('list_path', ''), ds.get('wav_dir', ''), maxine_status_text((state or {}).get('maxine_status')))
 
 
 def normalize_loaded_state(state):
     if not state:
-        return None
-    state.setdefault('save_name', 'minute_train_ja')
-    state.setdefault('speaker_name', state.get('save_name', 'minute_train_ja'))
+        return None, 0
+    state.setdefault('save_name', 'long_train_ja')
+    state.setdefault('speaker_name', state.get('save_name', 'long_train_ja'))
     state.setdefault('language_code', 'ja')
     state.setdefault('sources', [])
     state.setdefault('clips', [])
@@ -1152,6 +1075,7 @@ def normalize_loaded_state(state):
     state.setdefault('latest_weights', {})
     state.setdefault('session_kind', SESSION_KIND)
     state.setdefault('split_profile', '標準')
+    state.setdefault('silence_duration_sec', DEFAULT_SILENCE_DURATION_SEC)
     state.setdefault('min_duration_sec', 3.0)
     state.setdefault('maxine_status', detect_maxine_assets())
     session_dir = Path(state['session_dir'])
@@ -1160,12 +1084,9 @@ def normalize_loaded_state(state):
     list_path = dataset_dir / 'annotations.list'
     wav_dir = dataset_dir / 'audio'
     session_json = dataset_dir / 'session.json'
-    if list_path.exists():
-        ds['list_path'] = str(list_path)
-    if wav_dir.exists():
-        ds['wav_dir'] = str(wav_dir)
-    if session_json.exists():
-        ds['session_json'] = str(session_json)
+    if list_path.exists(): ds['list_path'] = str(list_path)
+    if wav_dir.exists(): ds['wav_dir'] = str(wav_dir)
+    if session_json.exists(): ds['session_json'] = str(session_json)
     missing_trimmed = 0
     for clip in state['clips']:
         clip.setdefault('trimmed_path', '')
@@ -1188,47 +1109,111 @@ def normalize_loaded_state(state):
     return state, missing_trimmed
 
 
+def maxine_dependency_dirs(dll_path):
+    dll_dir = Path(dll_path).parent
+    runtime_root = dll_dir.parent
+    return [str(runtime_root), str(dll_dir), str(dll_dir / 'external' / 'cuda' / 'bin'), str(dll_dir / 'external' / 'nvtrt' / 'bin'), str(dll_dir / 'external' / 'openssl' / 'bin')]
+
+
+def maxine_export_available(dll_path):
+    if platform.system() != 'Windows':
+        return False, 'Windows 以外では未対応です。'
+    required_exports = ['NvAFX_GetEffectList', 'NvAFX_GetFloatList']
+    old_path = os.environ.get('PATH', '')
+    dep_dirs = [p for p in maxine_dependency_dirs(dll_path) if Path(p).exists()]
+    handles = []
+    if dep_dirs:
+        os.environ['PATH'] = os.pathsep.join(dep_dirs + [old_path]) if old_path else os.pathsep.join(dep_dirs)
+        add_dir = getattr(os, 'add_dll_directory', None)
+        if add_dir is not None:
+            for dep_dir in dep_dirs:
+                try: handles.append(add_dir(dep_dir))
+                except Exception: pass
+    try:
+        lib = ctypes.WinDLL(str(dll_path))
+        missing = []
+        for export_name in required_exports:
+            try: getattr(lib, export_name)
+            except Exception: missing.append(export_name)
+        if missing:
+            return False, '不足エクスポート: ' + ', '.join(missing)
+        return True, ''
+    except Exception as exc:
+        return False, str(exc)
+    finally:
+        for handle in handles:
+            try: handle.close()
+            except Exception: pass
+        os.environ['PATH'] = old_path
+
+
+def detect_maxine_assets(force=False):
+    global MAXINE_CACHE
+    if MAXINE_CACHE is not None and not force:
+        return dict(MAXINE_CACHE)
+    status = {'available': False, 'reason': '', 'effects_demo': str(MAXINE_EFFECTS_DEMO), 'model_path': '', 'dll_dir': '', 'dll_path': '', 'version': ''}
+    if not MAXINE_EFFECTS_DEMO.exists():
+        status['reason'] = f'effects_demo.exe が見つかりません: {MAXINE_EFFECTS_DEMO}'
+        MAXINE_CACHE = status
+        return dict(status)
+    if not MAXINE_RUNTIME_BIN.exists():
+        status['reason'] = f'AFX ランタイムが見つかりません: {MAXINE_RUNTIME_BIN}'
+        MAXINE_CACHE = status
+        return dict(status)
+    if not MAXINE_MODELS_ROOT.exists():
+        status['reason'] = f'AFX モデルディレクトリが見つかりません: {MAXINE_MODELS_ROOT}'
+        MAXINE_CACHE = status
+        return dict(status)
+    dll_path = MAXINE_RUNTIME_BIN / 'NVAudioEffects.dll'
+    model_path = MAXINE_MODELS_ROOT / 'denoiser_48k.trtpkg'
+    if not dll_path.exists():
+        status['reason'] = f'AFX DLL が見つかりません: {dll_path}'
+        MAXINE_CACHE = status
+        return dict(status)
+    if not model_path.exists():
+        status['reason'] = f'AFX モデルが見つかりません: {model_path}'
+        MAXINE_CACHE = status
+        return dict(status)
+    ok, reason = maxine_export_available(dll_path)
+    if not ok:
+        status['reason'] = f'AFX DLL を読み込めません: {reason}'
+        MAXINE_CACHE = status
+        return dict(status)
+    status.update({'available': True, 'reason': '', 'model_path': str(model_path), 'dll_dir': str(MAXINE_RUNTIME_BIN), 'dll_path': str(dll_path), 'version': '1.6.1.2-GA-Ada'})
+    MAXINE_CACHE = status
+    return dict(status)
+
+
+def maxine_status_text(status):
+    if not status:
+        return 'Maxine 状態: 未確認'
+    if status.get('available'):
+        return 'Maxine 状態: 利用可能  \\n- モデル: `' + status.get('model_path', '') + '`  \\n- DLL: `' + status.get('dll_dir', '') + '`  \\n- 実行ファイル: `' + status.get('effects_demo', '') + '`'
+    return f'Maxine 状態: 利用不可  \\n- 理由: {status.get("reason", "不明")}'
+
+
 def load_saved_session(session_name):
     session_name = session_name_from_choice(session_name)
     choices = session_options()
     if not session_name:
-        return (
-            None, '読み込むセッションを選んでください。', [], [], [], {}, '', '', maxine_status_text(detect_maxine_assets()),
-            'minute_train_ja', 'minute_train_ja', 'ja', '標準', 3.0,
-            gr.update(choices=choices, value=None),
-        )
+        return (None, '読み込むセッションを選んでください。', [], [], [], {}, '', '', maxine_status_text(detect_maxine_assets()), 'long_train_ja', 'long_train_ja', 'ja', '標準', DEFAULT_SILENCE_DURATION_SEC, 3.0, gr.update(choices=choices, value=None))
     session_dir = SESSION_ROOT / session_name
     state_path = session_dir / 'session_state.json'
     fallback_path = session_dir / 'dataset' / 'session.json'
     target = state_path if state_path.exists() else fallback_path
     if not target.exists():
-        return (
-            None, f'セッション情報が見つかりません: {session_name}', [], [], [], {}, '', '', maxine_status_text(detect_maxine_assets()),
-            'minute_train_ja', 'minute_train_ja', 'ja', '標準', 3.0,
-            gr.update(choices=choices, value=session_name if session_name in choices else None),
-        )
+        return (None, f'セッション情報が見つかりません: {session_name}', [], [], [], {}, '', '', maxine_status_text(detect_maxine_assets()), 'long_train_ja', 'long_train_ja', 'ja', '標準', DEFAULT_SILENCE_DURATION_SEC, 3.0, gr.update(choices=choices, value=session_name if session_name in choices else None))
     state = json.loads(target.read_text(encoding='utf-8'))
     state, missing_trimmed = normalize_loaded_state(state)
     message = f'セッションを読み込みました: {session_name}'
     if missing_trimmed:
         message += f'。一時トリム音声 {missing_trimmed} 件は元ファイル参照に戻しています。'
     ds = state.get('dataset', {})
-    return (
-        state, message, source_rows(state), clip_rows(state), skipped_rows(state), state_summary(state),
-        ds.get('list_path', ''), ds.get('wav_dir', ''), maxine_status_text(state.get('maxine_status')),
-        state.get('save_name', 'minute_train_ja'), state.get('speaker_name', state.get('save_name', 'minute_train_ja')),
-        state.get('language_code', 'ja'), state.get('split_profile', '標準'), state.get('min_duration_sec', 3.0),
-        gr.update(choices=choices, value=session_name),
-    )
+    return (state, message, source_rows(state), clip_rows(state), skipped_rows(state), state_summary(state), ds.get('list_path', ''), ds.get('wav_dir', ''), maxine_status_text(state.get('maxine_status')), state.get('save_name', 'long_train_ja'), state.get('speaker_name', state.get('save_name', 'long_train_ja')), state.get('language_code', 'ja'), state.get('split_profile', '標準'), state.get('silence_duration_sec', DEFAULT_SILENCE_DURATION_SEC), state.get('min_duration_sec', 3.0), gr.update(choices=choices, value=session_name))
 
 
-def run_command(args, *, cwd=None, env=None, process_name='command'):
-    proc = subprocess.run(args, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='replace')
-    if proc.returncode != 0:
-        tail = (proc.stderr or proc.stdout or '').strip()
-        raise RuntimeError(f'[{process_name}] ' + tail[-2000:])
-    return proc.stdout, proc.stderr
-
+def prepare_anime_whisper():
+    return prepare_whisper('quantumcookie/anime-whisper-ct2')
 
 def load_sources(files, save_name, speaker_name, language_code):
     if not files:
@@ -1241,56 +1226,74 @@ def load_sources(files, save_name, speaker_name, language_code):
         ext = src.suffix or '.wav'
         dst = upload_dir / f'{i:03d}{ext}'
         shutil.copy2(src, dst)
-        sources.append({
-            'id': i,
-            'name': src.name,
-            'kind': source_kind(src),
-            'original_path': str(src),
-            'upload_path': str(dst),
-            'extracted_audio_path': '',
-            'denoised_audio_path': '',
-            'active_audio_path': '',
-            'duration': 0.0,
-            'maxine_applied': False,
-        })
+        sources.append({'id': i, 'name': src.name, 'kind': source_kind(src), 'original_path': str(src), 'upload_path': str(dst), 'extracted_audio_path': '', 'denoised_audio_path': '', 'active_audio_path': '', 'duration': 0.0, 'maxine_applied': False})
     state['sources'] = sources
     state['clips'] = []
     state['skipped_clips'] = []
     save_state(state)
-    return editor_outputs(state, f'{len(sources)} 個の素材を読み込みました。次に「音声を抽出」を押してください。')
+    return editor_outputs(state, f'{len(sources)} 個の素材を読み込みました。Whisper に直接渡すか、必要なら無音分割や Maxine を実行してください。')
 
 
 def extract_source_audio(input_path, output_path):
     run_command(['ffmpeg', '-y', '-i', str(input_path), '-vn', '-ac', '1', '-ar', '48000', '-sample_fmt', 's16', str(output_path)], cwd=str(ROOT_DIR), process_name='音声抽出')
 
 
+def ensure_source_audio_prepared(state):
+    if not state or not state.get('sources'):
+        return False, '先に素材を読み込んでください。'
+    extracted_dir = Path(state['session_dir']) / 'extracted'
+    extracted_dir.mkdir(parents=True, exist_ok=True)
+    changed = False
+    for source in state['sources']:
+        active_path = source.get('active_audio_path')
+        if active_path and Path(active_path).exists():
+            if not source.get('duration'):
+                source['duration'] = duration_of(str(active_path))
+                changed = True
+            continue
+        output_path = extracted_dir / f"{source['id']:03d}.wav"
+        extracted_path = source.get('extracted_audio_path')
+        if not extracted_path or not Path(extracted_path).exists():
+            extract_source_audio(source['upload_path'], output_path)
+            source['extracted_audio_path'] = str(output_path)
+            source['denoised_audio_path'] = ''
+            source['maxine_applied'] = False
+            extracted_path = str(output_path)
+            changed = True
+        active_path = source.get('denoised_audio_path') or extracted_path
+        source['active_audio_path'] = str(active_path)
+        source['duration'] = duration_of(str(active_path))
+        changed = True
+    state['maxine_status'] = detect_maxine_assets(force=True)
+    if changed:
+        save_state(state)
+    return True, ''
+
+
+def rebuild_clips_from_sources(state):
+    state['clips'] = []
+    state['skipped_clips'] = []
+    clip_id = 0
+    for source in state.get('sources', []):
+        active_path = source.get('active_audio_path') or source.get('extracted_audio_path') or source.get('upload_path')
+        if not active_path or not Path(active_path).exists():
+            continue
+        duration = round(source.get('duration') or duration_of(str(active_path)), 4)
+        state['clips'].append({'id': clip_id, 'name': f"{Path(source['name']).stem}.wav", 'source_name': source['name'], 'source_path': str(active_path), 'trimmed_path': '', 'duration': duration, 'trim_start': 0.0, 'trim_end': duration, 'text': '', 'keep': True, 'segment_start': 0.0, 'segment_end': duration})
+        clip_id += 1
+
+
 def extract_sources(state):
     if not state or not state.get('sources'):
         return editor_outputs(state, '先に素材を読み込んでください。')
-    extracted_dir = Path(state['session_dir']) / 'extracted'
-    for source in state['sources']:
-        output_path = extracted_dir / f"{source['id']:03d}.wav"
-        extract_source_audio(source['upload_path'], output_path)
-        source['extracted_audio_path'] = str(output_path)
-        source['active_audio_path'] = str(output_path)
-        source['denoised_audio_path'] = ''
-        source['maxine_applied'] = False
-        source['duration'] = duration_of(str(output_path))
-    state['maxine_status'] = detect_maxine_assets(force=True)
-    save_state(state)
-    return editor_outputs(state, '素材から音声を抽出しました。必要なら Maxine でノイズ除去し、その後で無音分割してください。')
+    ok, message = ensure_source_audio_prepared(state)
+    if not ok:
+        return editor_outputs(state, message)
+    return editor_outputs(state, '素材から音声を抽出しました。Whisper に直接渡すか、必要なら Maxine や無音分割を実行してください。')
 
 
 def run_maxine_denoiser(input_wav, output_wav, maxine_status):
-    cfg_text = (
-        'effect denoiser\n'
-        f'input_wav {input_wav}\n'
-        f'output_wav {output_wav}\n'
-        'real_time 0\n'
-        'intensity_ratio 1.0\n'
-        'enable_vad 0\n'
-        f'model {maxine_status["model_path"]}\n'
-    )
+    cfg_text = 'effect denoiser\n' + f'input_wav {input_wav}\n' + f'output_wav {output_wav}\n' + 'real_time 0\n' + 'intensity_ratio 1.0\n' + 'enable_vad 0\n' + f'model {maxine_status["model_path"]}\n'
     with tempfile.NamedTemporaryFile('w', suffix='.txt', delete=False, encoding='utf-8') as fp:
         fp.write(cfg_text)
         cfg_path = fp.name
@@ -1300,17 +1303,16 @@ def run_maxine_denoiser(input_wav, output_wav, maxine_status):
         env['PATH'] = os.pathsep.join(path_parts + [env.get('PATH', '')]) if env.get('PATH', '') else os.pathsep.join(path_parts)
         run_command([str(MAXINE_EFFECTS_DEMO), '-c', cfg_path], cwd=str(MAXINE_EFFECTS_DEMO.parent), env=env, process_name='Maxine denoise')
     finally:
-        try:
-            os.unlink(cfg_path)
-        except OSError:
-            pass
+        try: os.unlink(cfg_path)
+        except OSError: pass
 
 
 def apply_maxine(state):
     if not state or not state.get('sources'):
         return editor_outputs(state, '先に素材を読み込んでください。')
-    if not all(source.get('extracted_audio_path') for source in state['sources']):
-        return editor_outputs(state, '先に「音声を抽出」を実行してください。')
+    ok, message = ensure_source_audio_prepared(state)
+    if not ok:
+        return editor_outputs(state, message)
     status = detect_maxine_assets(force=True)
     state['maxine_status'] = status
     if not status.get('available'):
@@ -1341,13 +1343,13 @@ def apply_maxine(state):
     return editor_outputs(state, 'Maxine によるノイズ除去が完了しました。')
 
 
-def detect_speech_segments(audio_path, split_profile):
+def detect_speech_segments(audio_path, split_profile, silence_duration_sec=None):
     profile = SPLIT_PROFILES.get(split_profile, SPLIT_PROFILES['標準'])
+    duration = float(silence_duration_sec if silence_duration_sec is not None else profile['duration'])
+    if duration <= 0:
+        raise ValueError('無音検出時間は 0 より大きい値にしてください。')
     total = duration_of(audio_path)
-    proc = subprocess.run(
-        ['ffmpeg', '-hide_banner', '-i', str(audio_path), '-af', f"silencedetect=noise={profile['noise']}:d={profile['duration']}", '-f', 'null', '-'],
-        cwd=str(ROOT_DIR), stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='replace'
-    )
+    proc = subprocess.run(['ffmpeg', '-hide_banner', '-i', str(audio_path), '-af', f"silencedetect=noise={profile['noise']}:d={duration}", '-f', 'null', '-'], cwd=str(ROOT_DIR), stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='replace')
     if proc.returncode not in (0, 255):
         raise RuntimeError((proc.stderr or '').strip()[-2000:])
     silence_start_re = re.compile(r'silence_start:\s*([0-9.]+)')
@@ -1380,12 +1382,12 @@ def cut_audio_segment(input_path, output_path, start_sec, end_sec):
     run_command(['ffmpeg', '-y', '-ss', f'{start_sec:.4f}', '-to', f'{end_sec:.4f}', '-i', str(input_path), '-vn', '-ac', '1', '-ar', '48000', '-sample_fmt', 's16', str(output_path)], cwd=str(ROOT_DIR), process_name='無音分割')
 
 
-def split_sources(state, split_profile, min_duration_sec):
+def split_sources(state, split_profile, silence_duration_sec, min_duration_sec):
     if not state or not state.get('sources'):
         return editor_outputs(state, '先に素材を読み込んでください。')
-    ready_sources = [source for source in state['sources'] if source.get('active_audio_path') or source.get('extracted_audio_path')]
-    if not ready_sources:
-        return editor_outputs(state, '先に「音声を抽出」を実行してください。')
+    ok, message = ensure_source_audio_prepared(state)
+    if not ok:
+        return editor_outputs(state, message)
     segments_dir = Path(state['session_dir']) / 'segments'
     if segments_dir.exists():
         shutil.rmtree(segments_dir)
@@ -1393,13 +1395,14 @@ def split_sources(state, split_profile, min_duration_sec):
     state['clips'] = []
     state['skipped_clips'] = []
     state['split_profile'] = split_profile
+    state['silence_duration_sec'] = float(silence_duration_sec)
     state['min_duration_sec'] = float(min_duration_sec)
     clip_id = 0
     for source in state['sources']:
         active_path = source.get('active_audio_path') or source.get('extracted_audio_path')
         if not active_path:
             continue
-        for seg_idx, (start, end) in enumerate(detect_speech_segments(active_path, split_profile)):
+        for seg_idx, (start, end) in enumerate(detect_speech_segments(active_path, split_profile, silence_duration_sec)):
             duration = round(end - start, 4)
             if duration < float(min_duration_sec):
                 state['skipped_clips'].append({'source_name': source['name'], 'segment_index': seg_idx, 'segment_start': start, 'segment_end': end, 'duration': duration, 'reason': f'{float(min_duration_sec):.1f} 秒以下'})
@@ -1407,83 +1410,37 @@ def split_sources(state, split_profile, min_duration_sec):
             out_path = segments_dir / f"{clip_id:03d}.wav"
             cut_audio_segment(active_path, out_path, start, end)
             actual_duration = duration_of(str(out_path))
-            state['clips'].append({
-                'id': clip_id,
-                'name': f"{Path(source['name']).stem}_{seg_idx:03d}.wav",
-                'source_name': source['name'],
-                'source_path': str(out_path),
-                'trimmed_path': '',
-                'duration': actual_duration,
-                'trim_start': 0.0,
-                'trim_end': actual_duration,
-                'text': '',
-                'keep': True,
-                'segment_start': start,
-                'segment_end': end,
-            })
+            state['clips'].append({'id': clip_id, 'name': f"{Path(source['name']).stem}_{seg_idx:03d}.wav", 'source_name': source['name'], 'source_path': str(out_path), 'trimmed_path': '', 'duration': actual_duration, 'trim_start': 0.0, 'trim_end': actual_duration, 'text': '', 'keep': True, 'segment_start': start, 'segment_end': end})
             clip_id += 1
     save_state(state)
     return editor_outputs(state, f'無音分割が完了しました。編集対象 {len(state["clips"])} 件 / 除外 {len(state["skipped_clips"])} 件。')
 
 
-def transcribe_all(state):
+def export_dataset(state, save_name, speaker_name, language_code):
     if not state or not state.get('clips'):
-        return editor_outputs(state, '先に無音分割を実行してください。')
-    try:
-        transcript_dir = Path(state['session_dir']) / 'transcripts'
-        transcript_dir.mkdir(parents=True, exist_ok=True)
-        summaries = []
-        success_count = 0
-        empty_count = 0
-        for clip in state['clips']:
-            target = clip['trimmed_path'] or clip['source_path']
-            text, language_name, confidence = transcribe_clip_with_whisper(target)
-            clip['text'] = text
-            transcript_path = transcript_dir / f"{clip['id']:03d}.txt"
-            transcript_path.write_text(text + ('\n' if text else ''), encoding='utf-8')
-            preview = text if text else '<<空文字>>'
-            if len(preview) > 60:
-                preview = preview[:60] + '...'
-            summaries.append(f"- {clip['name']}: {preview}")
-            if text:
-                success_count += 1
-            else:
-                empty_count += 1
-        save_state(state)
-        summary_text = '\n'.join(summaries[:12])
-        if len(summaries) > 12:
-            summary_text += f"\n- 他 {len(summaries) - 12} 件"
-        message = f"Whisper 書き起こし完了: {success_count}/{len(state['clips'])} 件。空文字 {empty_count} 件。  \\n保存先: {transcript_dir}  \\n{summary_text}"
-        return editor_outputs(state, message)
-    except Exception as exc:
-        traceback.print_exc()
-        return editor_outputs(state, f'Whisper 書き起こしに失敗しました: {exc}')
-
-
-def save_editor_rows(state, *values):
-    if not state or not state.get('clips'):
-        return state, '先に無音分割を実行してください。', clip_rows(state), state_summary(state)
-    state, materialized = materialize_session(state, state.get('save_name', 'long_train_ja'), state.get('speaker_name', ''), state.get('language_code', 'ja'))
-    expected = len(state['clips']) * 3
-    if len(values) != expected:
-        return state, '編集欄の数が一致しません。画面を再読み込みしてもう一度試してください。', clip_rows(state), state_summary(state)
-    idx = 0
-    transcript_dir = Path(state['session_dir']) / 'transcripts'
-    transcript_dir.mkdir(parents=True, exist_ok=True)
+        return editor_outputs(state, '先に素材を読み込んでください。')
+    state['save_name'] = sanitize_name(save_name)
+    state['speaker_name'] = derive_speaker(save_name, speaker_name)
+    state['language_code'] = (language_code or 'ja').strip() or 'ja'
+    dataset_dir = Path(state['session_dir']) / 'dataset'
+    audio_dir = dataset_dir / 'audio'
+    audio_dir.mkdir(parents=True, exist_ok=True)
+    rows = []
     for clip in state['clips']:
-        audio_path = values[idx]
-        text_value = values[idx + 1]
-        keep_value = values[idx + 2]
-        clip['trimmed_path'] = str(audio_path) if audio_path else clip.get('trimmed_path', '')
-        clip['text'] = (text_value or '').strip()
-        clip['keep'] = bool(keep_value)
-        (transcript_dir / f"{clip['id']:03d}.txt").write_text((clip['text'] + '\n') if clip['text'] else '', encoding='utf-8')
-        idx += 3
-    save_state(state)
-    kept = sum(1 for clip in state['clips'] if clip['keep'])
-    filled = sum(1 for clip in state['clips'] if clip['text'])
-    prefix = '新規保存しました。' if materialized else '一覧の編集を保存しました。'
-    return state, f'{prefix} 採用 {kept} 件 / テキスト入力済み {filled} 件。保存先: {Path(state["session_dir"]) / "session_state.json"}', clip_rows(state), state_summary(state)
+        if not clip['keep'] or not clip['text'].strip():
+            continue
+        src = clip['trimmed_path'] or clip['source_path']
+        dst = audio_dir / f"{clip['id']:03d}.wav"
+        shutil.copy2(src, dst)
+        rows.append(f"{dst.name}|{state['speaker_name']}|{state['language_code']}|{clip['text'].strip()}")
+    if not rows:
+        return editor_outputs(state, '採用クリップとテキストが必要です。')
+    list_path = dataset_dir / 'annotations.list'
+    list_path.write_text('\n'.join(rows) + '\n', encoding='utf-8')
+    session_json = dataset_dir / 'session.json'
+    session_json.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding='utf-8')
+    state['dataset'] = {'list_path': str(list_path), 'wav_dir': str(audio_dir), 'session_json': str(session_json)}
+    return editor_outputs(state, f'学習フォーマットを生成しました。採用クリップ数: {len(rows)}')
 def build_app():
     with gr.Blocks(title='GPT-SoVITS 長尺学習 UI', css=css, js=js) as app:
         gr.HTML(top_html)
@@ -1507,23 +1464,27 @@ def build_app():
                 with gr.Row():
                     uploads = gr.File(label='長い音声 / 動画をまとめてドロップ', file_count='multiple', file_types=SUPPORTED_UPLOAD_EXTS)
                     with gr.Column():
-                        gr.Markdown('1. 素材を読み込む  2. 音声を抽出  3. 必要なら Maxine でノイズ除去  4. 無音分割  5. Whisper で書き起こし、の順で進めます。')
+                        gr.Markdown('1. 素材を読み込む  2. Whisper に直接渡すか、必要なら Maxine / 無音分割を挟む  3. 書き起こしを確認して学習データを書き出します。')
                         split_profile = gr.Dropdown(label='無音分割プリセット', choices=list(SPLIT_PROFILES.keys()), value='標準')
+                        silence_duration_sec = gr.Number(label='無音検出時間(秒)', value=DEFAULT_SILENCE_DURATION_SEC, minimum=0.05, info='この秒数以上続いた無音だけを区切りとして使います。小さくすると細かく切れます。')
                         min_duration_sec = gr.Number(label='最低クリップ秒数', value=3.0, info='この秒数以下のクリップは一覧に出さず、スキップ一覧に記録します。')
                         with gr.Row():
                             load_btn = gr.Button('素材を読み込む', variant='primary')
                             extract_btn = gr.Button('音声を抽出')
                             maxine_btn = gr.Button('Maxineでノイズ除去')
+                        whisper_choice = gr.Radio(label='Whisper モデル', choices=['turbo', 'anime-whisper'], value='turbo')
                         with gr.Row():
                             split_btn = gr.Button('無音分割', variant='primary')
                             whisper_btn = gr.Button('Whisper モデルを準備')
                             transcribe_btn = gr.Button('Whisperで書き起こし')
+                        gr.Markdown('Whisperで書き起こし は、無音分割済みならそのクリップ群を、未分割なら素材ごとに 1 クリップとしてそのまま書き起こします。')
+                        gr.Markdown('ラジオで選んだモデルが使われます。Whisperで書き起こし を押した時も、選択中モデルを自動で準備してから実行します。')
                         gr.Markdown('既に作業済みのセッションを再開したい場合は、下の一覧から読み込めます。')
                         with gr.Row():
                             session_picker = gr.Dropdown(label='保存済みセッション', choices=session_options(), value=None, allow_custom_value=False)
                             refresh_sessions_btn = gr.Button('一覧を更新')
                             load_session_btn = gr.Button('選択したセッションを読み込む')
-                            clone_session_btn = gr.Button('別セッションとして保存')
+                            clone_session_btn = gr.Button('保存済み内容で別セッション保存')
                             delete_session_btn = gr.Button('選択したセッションを削除')
                 source_table = gr.Dataframe(headers=['ID', '種別', 'ファイル', '秒数', '抽出', 'Maxine'], datatype=['number', 'str', 'str', 'str', 'str', 'str'], interactive=False, wrap=True, label='素材一覧')
                 skip_table = gr.Dataframe(headers=['素材', '区間', '秒数', '理由'], datatype=['str', 'str', 'str', 'str'], interactive=False, wrap=True, label='除外クリップ一覧')
@@ -1534,7 +1495,7 @@ def build_app():
                 @gr.render(inputs=state)
                 def render_clip_editors(current_state):
                     if not current_state or not current_state.get('clips'):
-                        gr.Markdown('まだ無音分割されたクリップがありません。')
+                        gr.Markdown('まだ編集対象クリップがありません。Whisper 直接書き起こし、または無音分割を実行してください。')
                         return
                     row_inputs = []
                     for clip in current_state['clips']:
@@ -1547,9 +1508,12 @@ def build_app():
                                 keep_editor = gr.Checkbox(value=clip['keep'], label='このクリップを学習に使う')
                             row_inputs.extend([audio_editor, text_editor, keep_editor])
                         gr.Markdown('---')
-                    save_all_btn = gr.Button('現在のセッションに上書き保存', variant='primary')
+                    with gr.Row():
+                        save_all_btn = gr.Button('現在のセッションに上書き保存', variant='primary')
+                        clone_from_editor_btn = gr.Button('編集内容を反映して別セッションとして保存')
                     save_all_btn.click(save_editor_rows, [state] + row_inputs, [state, status, clip_table, session_json])
-                    gr.Markdown('読み込み済みの既存セッションなら、そのまま同じ `session_state.json` と `transcripts/*.txt` に上書き保存されます。')
+                    clone_from_editor_btn.click(clone_current_session_with_rows, [state, save_name, speaker_name, language_code] + row_inputs, [state, status, source_table, clip_table, skip_table, session_json, list_path, wav_dir, maxine_info, session_picker])
+                    gr.Markdown('読み込み済みの既存セッションなら、そのまま同じ `session_state.json` と `transcripts/*.txt` に上書き保存されます。別名保存したい時は右のボタンを使うと、未保存の編集内容も一緒に複製されます。')
 
                 gr.Markdown('## 学習データ書き出し\nここで `annotations.list` と学習用 WAV 一式を作ります。')
                 with gr.Row():
@@ -1583,6 +1547,7 @@ def build_app():
                         lora_rank = gr.Number(label='LoRA rank(v4 用)', value=32, precision=0)
                         if_save_latest = gr.Checkbox(label='latest を保存', value=True)
                         if_save_every_weights = gr.Checkbox(label='各 epoch の重みも保存', value=True, info='オフでも最終 epoch の重みは保存されます。')
+                        cleanup_after_train = gr.Checkbox(label='学習完了後に不要物を削除', value=True, info='推論用の最新重みだけ残し、logs 配下と同実験の旧重みを削除します。セッションの音声・キャプションは残します。')
                         if_grad_ckpt = gr.Checkbox(label='gradient checkpoint', value=False)
                         if_dpo = gr.Checkbox(label='DPO を有効化', value=False)
                 with gr.Row():
@@ -1601,20 +1566,20 @@ def build_app():
         load_btn.click(load_sources, [uploads, save_name, speaker_name, language_code], shared_outputs)
         extract_btn.click(extract_sources, [state], shared_outputs)
         maxine_btn.click(apply_maxine, [state], shared_outputs)
-        split_btn.click(split_sources, [state, split_profile, min_duration_sec], shared_outputs)
-        whisper_btn.click(prepare_whisper, outputs=[status])
-        transcribe_btn.click(transcribe_all, [state], shared_outputs)
+        split_btn.click(split_sources, [state, split_profile, silence_duration_sec, min_duration_sec], shared_outputs)
+        whisper_btn.click(prepare_whisper_selection, [whisper_choice], [status])
+        transcribe_btn.click(prepare_whisper_selection, [whisper_choice], [status]).then(transcribe_all, [state], shared_outputs)
         export_btn.click(export_dataset, [state, save_name, speaker_name, language_code], shared_outputs)
         refresh_sessions_btn.click(refresh_session_list, [session_picker], [session_picker, status])
-        load_session_btn.click(load_saved_session, [session_picker], [state, status, source_table, clip_table, skip_table, session_json, list_path, wav_dir, maxine_info, save_name, speaker_name, language_code, split_profile, min_duration_sec, session_picker])
+        load_session_btn.click(load_saved_session, [session_picker], [state, status, source_table, clip_table, skip_table, session_json, list_path, wav_dir, maxine_info, save_name, speaker_name, language_code, split_profile, silence_duration_sec, min_duration_sec, session_picker])
         clone_session_btn.click(clone_current_session, [state, save_name, speaker_name, language_code], [state, status, source_table, clip_table, skip_table, session_json, list_path, wav_dir, maxine_info, session_picker])
         delete_session_btn.click(delete_saved_session, [session_picker], [session_picker, status])
         version.change(version_weight_updates, [version, custom_pretrained], [pretrained_s1, pretrained_s2g, pretrained_s2d, model_guide])
         custom_pretrained.change(custom_pretrained_updates, [custom_pretrained, version], [pretrained_s1, pretrained_s2g, pretrained_s2d, model_guide])
         preprocess_btn.click(preprocess_action, [state, version, gpu_number, bert_dir, ssl_dir, pretrained_s2g, sv_path], [state, status, session_json, train_log])
-        sovits_btn.click(sovits_action, [state, version, gpu_number, sovits_batch_size, sovits_epoch, save_every_epoch, if_save_latest, if_save_every_weights, text_low_lr_rate, if_grad_ckpt, lora_rank, pretrained_s2g, pretrained_s2d], [state, status, session_json, train_log])
-        gpt_btn.click(gpt_action, [state, version, gpu_number, gpt_batch_size, gpt_epoch, save_every_epoch, if_save_latest, if_save_every_weights, if_dpo, pretrained_s1], [state, status, session_json, train_log])
-        full_btn.click(full_pipeline_action, [state, version, gpu_number, bert_dir, ssl_dir, pretrained_s2g, sv_path, sovits_batch_size, sovits_epoch, save_every_epoch, if_save_latest, if_save_every_weights, text_low_lr_rate, if_grad_ckpt, lora_rank, pretrained_s2d, gpt_batch_size, gpt_epoch, if_dpo, pretrained_s1], [state, status, session_json, train_log])
+        sovits_btn.click(sovits_action, [state, version, gpu_number, sovits_batch_size, sovits_epoch, save_every_epoch, if_save_latest, if_save_every_weights, cleanup_after_train, text_low_lr_rate, if_grad_ckpt, lora_rank, pretrained_s2g, pretrained_s2d], [state, status, session_json, train_log])
+        gpt_btn.click(gpt_action, [state, version, gpu_number, gpt_batch_size, gpt_epoch, save_every_epoch, if_save_latest, if_save_every_weights, cleanup_after_train, if_dpo, pretrained_s1], [state, status, session_json, train_log])
+        full_btn.click(full_pipeline_action, [state, version, gpu_number, bert_dir, ssl_dir, pretrained_s2g, sv_path, sovits_batch_size, sovits_epoch, save_every_epoch, if_save_latest, if_save_every_weights, cleanup_after_train, text_low_lr_rate, if_grad_ckpt, lora_rank, pretrained_s2d, gpt_batch_size, gpt_epoch, if_dpo, pretrained_s1], [state, status, session_json, train_log])
         stop_btn.click(stop_current_process, outputs=[status])
         refresh_btn.click(refresh_latest_weights, [state, version], [state, session_json])
         open_infer_btn.click(open_inference_ui, outputs=[status])
@@ -1623,6 +1588,31 @@ def build_app():
 
 if __name__ == '__main__':
     build_app().queue().launch(server_name='0.0.0.0', server_port=DEFAULT_PORT, share=False, inbrowser=True)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
